@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Check that asset cross-references resolve — the pairing check #48 deferred to #50.
+
+Zero-dependency (stdlib only). Builds the id-set of all assets under one or more base dirs
+(default: platform-internals/examples/; override with argv[1:]) and verifies every reference —
+dependencies[], regression[], evaluates, evaluator — points at an id that exists. An unresolved
+reference is a dangling/missing asset. Several bases form ONE id-set, so a set of assets that
+legitimately reference each other across directories (the bundled skills, #119) closes as a set
+while staying scoped to the dirs the caller named.
+
+This is what agent-instructions/asset-metadata.md and platform-internals/examples/README.md name as "pairing cross-reference
+checking → #50". It powers `ws health` (missing-asset detection) and `ws regression` (a regression
+case whose dependencies no longer resolve = regression decay). The frontmatter parser is the same
+tiny one used by check-asset-metadata (key: scalar / key: [inline, list]).
+"""
+import re
+import sys
+import pathlib
+
+root = pathlib.Path(__file__).resolve().parent.parent
+bases = [pathlib.Path(a).resolve() for a in sys.argv[1:]] or [root / "platform-internals" / "examples"]
+
+REF_LIST_FIELDS = ("dependencies", "regression")
+REF_SCALAR_FIELDS = ("evaluates", "evaluator")
+
+
+def strip_quotes(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+        return s[1:-1]
+    return s
+
+
+def parse_value(val):
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        return [strip_quotes(x) for x in inner.split(",")] if inner else []
+    return strip_quotes(val)
+
+
+def parse_frontmatter(text):
+    m = re.match(r"^---\n(.*?)\n---", text, re.S)
+    if not m:
+        return None
+    data = {}
+    for line in m.group(1).splitlines():
+        mm = re.match(r"^([A-Za-z_][\w-]*):\s?(.*)$", line.rstrip())
+        if mm:
+            data[mm.group(1)] = parse_value(mm.group(2).strip())
+    return data
+
+
+assets = []
+seen = set()
+for base in bases:
+    for f in sorted(base.rglob("*.md")):
+        if f.name == "README.md" or f in seen:
+            continue
+        seen.add(f)
+        data = parse_frontmatter(f.read_text())
+        if data and "id" in data:
+            try:
+                rel = f.relative_to(root)
+            except ValueError:
+                rel = f
+            assets.append((rel, data))
+
+id_set = {d["id"] for _, d in assets if isinstance(d.get("id"), str)}
+
+errors = []
+for rel, d in assets:
+    refs = []
+    for field in REF_LIST_FIELDS:
+        v = d.get(field, [])
+        if isinstance(v, list):
+            refs += [(field, r) for r in v if r]
+    for field in REF_SCALAR_FIELDS:
+        v = d.get(field)
+        if isinstance(v, str) and v:
+            refs.append((field, v))
+    for field, ref in refs:
+        if ref not in id_set:
+            errors.append(f"{rel}: {field} -> '{ref}' does not resolve to any asset id")
+
+if not assets:
+    sys.exit("ERROR: no assets with an id found under " + ", ".join(str(b) for b in bases))
+
+if errors:
+    print("FAIL: asset cross-references")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+
+def _rel(b):
+    try:
+        return str(b.relative_to(root))
+    except ValueError:
+        return str(b)
+
+
+where = ", ".join(_rel(b) + "/" for b in bases)
+print(f"OK: {len(assets)} assets, all cross-references resolve within {where}")

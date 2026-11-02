@@ -1,0 +1,51 @@
+{
+  "meta": {
+    "since": "2026-08-10",
+    "until": "2026-08-16",
+    "generated_at": "2026-09-15T21:34:56+08:00",
+    "idle_gap_minutes": 30,
+    "legacy_annotations": 0
+  },
+  "tasks": [
+    {
+      "task": "other",
+      "task_id": "other",
+      "task_instance_id": "other",
+      "task_instance_ids": [
+        "other"
+      ],
+      "instances": 1,
+      "bucket": "other",
+      "branch": null,
+      "sessions": 3,
+      "first": "2026-08-10T20:00:05+08:00",
+      "last": "2026-08-10T21:00:00+08:00",
+      "instance_first": "2026-08-10T20:00:05+08:00",
+      "instance_last": "2026-08-10T21:00:00+08:00",
+      "top_model": "claude-fable-5",
+      "tokens": 600,
+      "messages": 4,
+      "explore": 2,
+      "edit": 1,
+      "run": 1,
+      "agent": 0,
+      "test": true,
+      "stage_sequence": [
+        "other",
+        "test",
+        "other"
+      ],
+      "stage_tokens": {
+        "other": 300,
+        "test": 300
+      },
+      "git": null,
+      "ref": null,
+      "task_type": null,
+      "result": null,
+      "first_pass": null,
+      "outcome": null,
+      "confidence": "低(仅自动)"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "daily": [
+    {
+      "period": "2026-08-10",
+      "agents": [
+        {
+          "agent": "claude",
+          "inputTokens": "not-a-number",
+          "outputTokens": 20,
+          "cacheReadTokens": 0,
+          "cacheCreationTokens": 0,
+          "modelBreakdowns": [
+            {
+              "modelName": "claude-fake",
+              "inputTokens": 10,
+              "outputTokens": 20,
+              "cost": 0.1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "<业务/职能 as in team.json business>": {
+    "monthly": 5000,
+    "currency": "USD"
+  }
+}

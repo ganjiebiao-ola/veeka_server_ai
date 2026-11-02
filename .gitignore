@@ -1,0 +1,114 @@
+# Mechanical backstop for the "no credential in the repo" red line (minimal safety net; harness check comes with #50)
+.env
+.env.*
+*.pem
+*.key
+*key*.json
+id_rsa*
+id_ed25519*
+*.p12
+*.pfx
+credentials*
+secrets*
+token*.txt
+
+# ── Three mount points: repos / skills / knowledge ────────────────
+# Teams git clone their business repos, existing skill libraries, and existing
+# knowledge bases in to mount them; each keeps its own .git and version. The
+# framework is read-only and non-locking, and does not track mounted content.
+# Each mount point keeps only its own README.md (what to put / how to mount).
+/repos/*
+!/repos/README.md
+# Everything under repos/ — files and sub-folders at any depth — stays untracked (only the
+# mount-point README above is kept): a mounted repo's own agent entries (CLAUDE.md/AGENTS.md)
+# are that repo's asset, versioned in its own git, and must never enter the framework git.
+# Local-only mirror of which repos are actually mounted (see workspace.yaml's frozen `repositories: []`
+# and scripts/setup-repos) — same "local, never tracked" idea as /repos/* above, one layer up.
+/workspace.local.yaml
+# Atomic-write temp file (setup-repos / setup-skills write `workspace.local.yaml.tmp` next to the
+# sidecar, then os.replace it). An interrupted run leaves it behind; ignore it so a broad
+# `git add -A` can never commit the local sidecar data the atomic write exists to protect.
+/workspace.local.yaml.tmp
+/skills/*
+!/skills/README.md
+# Template-bundled skills: written against the template itself, tracked and evolved in this repo
+# via normal PR flow (they have no separate upstream). Everything else under skills/ stays mounted —
+# including team-native skills, which live in team-context/skills/<id>/ and reach skills/ as symlinks.
+!/skills/workspace-context-bootstrap/
+!/skills/workspace-onboarding/
+!/skills/spec-authoring/
+!/skills/token-usage-analysis/
+!/skills/ai-usage-weekly/
+!/skills/incident-fix/
+!/skills/sre-autofix/
+!/skills/grafana-sls/
+!/skills/sre-inspect/
+!/skills/security-patch/
+!/skills/skills-source-loader/
+!/skills/workspace-upstream-sync/
+!/skills/workspace-update/
+!/skills/code-map-query/
+!/skills/code-map-scope/
+/knowledge/*
+!/knowledge/README.md
+# knowledge/ is no longer a pure "clone-in" mount like repos/ and skills/ above: its content is
+# authored/curated directly in this repo (there is no separate upstream to defer to), so it is
+# framework-tracked like the template-bundled skills exception above, not gitignored wholesale.
+!/knowledge/maps
+!/knowledge/product
+!/knowledge/workflows
+!/knowledge/bug-fixes
+!/knowledge/assets
+
+# Git worktrees of a mounted repos/<repo> (e.g. for reviewing a PR in isolation): same "mounted
+# business code, never enters the framework git" rule as /repos/* above, one layer up.
+/worktrees/
+
+# Skill-discovery symlinks (.claude/skills, .agents/skills): tracked as pointers only; the /skills/*
+# rule above keeps the mounted content itself untracked. Mechanism: agent-instructions/mount-points.md.
+
+# Golden-pack replay scaffolding (#44) — kept INSIDE each pack's own directory so repos/ stays
+# reserved for real business mounts: .origin/ is a real git repo materialized from the tracked
+# seed/ (stands in for upstream), .mount/ is the clone the recorded loop runs in. Never committed.
+/platform-internals/golden/*/.origin/
+/platform-internals/golden/*/.mount/
+# Legacy location of the same scaffolding (pre-move); keep ignored so a stale materialization on an
+# older checkout can never be committed by a broad `git add`. Delete the directory, then this line.
+/.golden-origin/
+
+# Findings — local, ad hoc analysis/review output the agent writes during a task (PR review notes,
+# guides, checklists); ephemeral and per-task, not committed. Directory itself stays tracked (via
+# its README) so a fresh checkout has somewhere to write findings to — same "keep dir, ignore
+# contents" pattern as /repos/* above, but this isn't a mount point (no cloned/mounted content).
+/findings/*
+!/findings/README.md
+
+# Run records (#50): local per-operator audit trail (may hold local paths); not committed.
+# The directory is created by `ws` / harness_guard on first use — it is not part of the checkout,
+# so a fresh clone has no empty runs/ to explain (#93). Format spec and a scrubbed demo specimen
+# are tracked as platform-internals/runs-format.md and platform-internals/runs-example-harness-block.jsonl.
+/runs/
+
+# Common local noise
+.DS_Store
+__pycache__/
+node_modules/
+*.log
+
+# Per-machine MCP server config written by `suites/sre-inspect/run mcp-config --write` (points at the
+# operator's docker + env; committing it would prompt every clone to trust a server).
+/.mcp.json
+
+# Operator's own copy of a suite's config (suites/<id>/config.yaml is the tracked template; the
+# local copy wins when present so `git pull` never conflicts with filled-in repo ids / checks).
+/suites/*/config.local.yaml
+# Same idea for suites/sre-inspect: the department instance tracks tenant.yaml / routes.yaml, while a
+# template checkout pointed at a real Grafana uses the gitignored *.local.yaml twins.
+/suites/*/*.local.yaml
+# suites/sre-inspect local HolmesGPT state (operator's config copy + spilled tool results)
+/suites/sre-inspect/holmes/.holmes/
+/suites/sre-inspect/holmes/tool-results/*
+!/suites/sre-inspect/holmes/tool-results/.gitkeep
+
+*.un~
+*.swp

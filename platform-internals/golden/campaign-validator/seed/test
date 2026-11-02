@@ -1,0 +1,57 @@
+#!/usr/bin/env sh
+# campaign-validator tests — run every case under tests/cases/ against validate.py.
+#
+# A case is a pair: <name>.json (the config) and <name>.expected (what must happen). The .expected
+# file holds one `exit=<n>` line and any number of `contains=<substring>` lines. Substrings, never
+# whole-output comparison — a message can gain detail without turning the suite red.
+#
+# TAP-ish output: "ok N - name" / "not ok N - name". Exit 0 only if every case passes.
+set -u
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+tmp=$(mktemp) || exit 2
+trap 'rm -f "$tmp"' EXIT
+
+n=0
+failed=0
+for cfg in "$here"/tests/cases/*.json; do
+  n=$((n + 1))
+  name=$(basename "$cfg" .json)
+  expected="$here/tests/cases/$name.expected"
+  if [ ! -f "$expected" ]; then
+    printf 'not ok %s - %s: no .expected file\n' "$n" "$name"
+    failed=$((failed + 1))
+    continue
+  fi
+
+  python3 "$here/validate.py" "$cfg" > "$tmp" 2>&1
+  got=$?
+  want=$(sed -n 's/^exit=//p' "$expected")
+  problem=""
+
+  [ "$got" = "$want" ] || problem="expected exit $want, got $got"
+
+  # every contains= line must appear somewhere in the output
+  if [ -z "$problem" ]; then
+    while IFS= read -r needle; do
+      [ -n "$needle" ] || continue
+      grep -qF -- "$needle" "$tmp" || { problem="output is missing: $needle"; break; }
+    done <<EOF
+$(sed -n 's/^contains=//p' "$expected")
+EOF
+  fi
+
+  if [ -n "$problem" ]; then
+    printf 'not ok %s - %s: %s\n' "$n" "$name" "$problem"
+    sed 's/^/    /' "$tmp"
+    failed=$((failed + 1))
+  else
+    printf 'ok %s - %s\n' "$n" "$name"
+  fi
+done
+
+printf '1..%s\n' "$n"
+if [ "$failed" -gt 0 ]; then
+  printf 'FAIL: campaign-validator tests (%s of %s failed)\n' "$failed" "$n"
+  exit 1
+fi
+printf 'OK: campaign-validator tests (%s passed)\n' "$n"

@@ -1,0 +1,78 @@
+{
+ "report_version": "1.1",
+ "scenario": "dive",
+ "trigger": "alert",
+ "generated_at": "2026-01-01T00:10:00Z",
+ "generator": "sre-orchestrator/report",
+ "incident": {
+  "id": "INC-20260101-000000-deadbeef",
+  "fingerprint": "deadbeefcafe0001",
+  "rule_uid": "rule-example-5xx",
+  "rid": "R-01",
+  "rule_name": "API | 5xx",
+  "layer": "L6",
+  "subject": "example-api",
+  "title": "example-api 5xx rate above threshold",
+  "eval_epoch": 1786440000,
+  "occurrences": 1,
+  "archive_dir": "/app/incidents/2026-01-01/INC-20260101-000000-deadbeef"
+ },
+ "status": {
+  "state": "ROOT_CAUSED",
+  "terminal": false,
+  "needs_human": false,
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:10:00Z"
+ },
+ "verdict": {
+  "value": "FAIL",
+  "source": "triage",
+  "template": "api-5xx.md",
+  "summary": "真异常",
+  "known_pattern": [],
+  "mentioned_patterns": []
+ },
+ "root_cause": {
+  "source": "dive",
+  "statement": "未定因。深挖只拿到自由文本结论：接口 500 与 ExampleSrv.php 异常同窗出现",
+  "chain": []
+ },
+ "evidence": [],
+ "excluded_hypotheses": [
+  {
+   "hypothesis": "下游 RPC 服务故障",
+   "why_ruled_out": "Prometheus 错误率为 0，返回空是灰度中的契约内行为"
+  }
+ ],
+ "data_gaps": [
+  "未拿到灰度开关的具体配置值"
+ ],
+ "suspect_change": "none",
+ "duplicate_of": "none",
+ "unfixable_reason": "",
+ "data_sources": [
+  "sls:example/app",
+  "prometheus"
+ ],
+ "sufficiency": {
+  "total": 88,
+  "grade": "充分"
+ },
+ "cost": {
+  "incident_usd": 0.21,
+  "tool_calls": 14,
+  "dive_duration_sec": 410.5
+ },
+ "degradations": [],
+ "timeline": [],
+ "attachments": {
+  "alert": "alert.json"
+ },
+ "completeness": {
+  "missing": []
+ },
+ "scrub": {
+  "findings": [],
+  "egress_blocked": false
+ }
+}

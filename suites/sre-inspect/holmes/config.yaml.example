@@ -1,0 +1,39 @@
+# HolmesGPT config for the OPTIONAL local instance (holmes/docker-compose.yaml). Copy to
+# holmes/.holmes/config.yaml (gitignored). Model routing is yours; only the data plane is fixed here:
+#   Prometheus / alert rules / dashboards -> mcp-grafana sidecar (streamable-http, bearer from env)
+#   SLS logs -> custom toolset sre-inspect/grafana-sls (tools/grafana-sls/sls_query.py)
+# No cloud access key enters this container. Root-level api_key does not interpolate {{ env }}:
+# the LLM key travels as OPENAI_API_KEY (env/.env.holmes) for openai/-prefixed models.
+model: "openai/TODO(owner): your model alias on the LLM gateway"
+api_base: "https://TODO(owner): your llm gateway/v1"
+max_steps: 40
+
+toolsets:
+  internet:
+    enabled: true
+  # bash MUST carry an explicit config block or over-limit tool results are destroyed instead of
+  # spilled (reference finding, holmes tool_calling_llm.py); core allowlist is enough to read spills.
+  bash:
+    enabled: true
+    config:
+      builtin_allowlist: core
+
+mcp_servers:
+  grafana_mcp:
+    description: "部门 Grafana（只读）：Prometheus 数据源查询、告警规则定义与状态、面板 PromQL、deeplink"
+    config:
+      url: "http://grafana-mcp:8000/mcp"
+      mode: streamable-http
+      extra_headers:
+        Authorization: "Bearer {{ env.MCP_GRAFANA_SERVER_TOKEN }}"
+    llm_instructions: |
+      指标一律用 query_prometheus（datasourceUid 从 list_datasources 取；queryType instant 也必须给 endTime；
+      startTime/endTime 用注入的 RFC3339 或 now-…，不做时区算术）。不知道指标名先 list_prometheus_metric_names /
+      list_prometheus_label_values；面板里的成熟查询用 get_dashboard_panel_queries。
+      告警规则的真实表达式与当前状态用 alerting_manage_rules(operation=get, rule_uid=<rule_uid>)。
+
+custom_toolsets:
+  - /toolsets/grafana-sls.custom_toolset.yaml
+
+custom_skill_paths:
+  - /skills

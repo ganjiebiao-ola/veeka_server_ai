@@ -1,0 +1,37 @@
+{
+  "name": "ola-agent-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --bun run vite",
+    "build": "bun --bun run vite build",
+    "typecheck": "bun --bun run tsc --noEmit && bun --bun run tsc --noEmit -p tests",
+    "test": "bun test --isolate tests"
+  },
+  "dependencies": {
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.55.0",
+    "radix-ui": "1.8.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "3.7.0"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "21.0.3",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
+    "@types/bun": "1.4.2",
+    "@types/react": "^18.3.10",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react-swc": "^3.7.0",
+    "happy-dom": "21.0.3",
+    "tailwindcss": "4.3.3",
+    "tw-animate-css": "1.4.0",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8"
+  }
+}

@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""Task-instance token correlation view (#32 S2.1 / #127).
+
+Builds one zero-manual task instance per Claude session segment, splitting again after
+more than 30 minutes without a message. Each row joins tokens, ordered work stages,
+tool-use behavior, instance-window Git signals, and an optional structured outcome.
+Opaque stable IDs contain no raw session identifier. Multiple instances carrying the
+same explicit issue ref merge into one manually confirmed task.
+
+Zero-dependency: python3 stdlib (sqlite3 included) + git. Everything stays on this machine.
+
+Zero-manual contract (hard): the report is fully usable with NO annotations — annotation
+only raises confidence from 推断 to 标注. The local DB stores sanitized instance metadata
+(opaque ID, bucket, branch, time window) plus structured labels; never prompts, free text,
+tool output, file paths, raw session IDs, or user identifiers. Legacy v1 rows are preserved
+in a quarantine table and never attached automatically.
+
+Storage: runs/token-usage/annotations.sqlite (gitignored, local-only).
+Codex sessions carry no branch/message granularity and are out of this view (see
+references/metrics-guide.md); the aggregate report covers them.
+
+Exit codes: 0 ok; 2 no session data found (vacuous-green law).
+"""
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from importlib.machinery import SourceFileLoader
+
+if sys.version_info < (3, 9):
+    _name = os.path.basename(__file__)
+    sys.stderr.write("FAIL: %s needs Python 3.9 or newer; this is Python %s (%s). Run it with a newer python3 "
+                     "(on macOS: /usr/bin/python3 scripts/%s ...).\n" % (_name, sys.version.split()[0],
+                                                                         sys.executable, _name))
+    sys.exit(2)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_loader = SourceFileLoader("_tur", os.path.join(_HERE, "token-usage-report"))
+_tur = importlib.util.module_from_spec(importlib.util.spec_from_loader("_tur", _loader))
+_loader.exec_module(_tur)
+
+EXPLORE_TOOLS = {"Read", "Grep", "Glob", "WebFetch", "WebSearch", "ToolSearch", "LS", "NotebookRead"}
+EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+RUN_TOOLS = {"Bash", "BashOutput", "KillShell"}
+AGENT_TOOLS = {"Agent", "Task"}
+TEST_HINT = re.compile(r"\btest|smoke|pytest|jest|vitest|regression\b", re.IGNORECASE)
+GRAPH_QUERIES = {"search_graph", "trace_path", "query_graph", "get_code_snippet", "get_file_outline", "get_architecture"}
+GRAPH_SETUP = {"list_projects", "index_repository", "index_status", "get_graph_schema"}
+LOOKUP_KINDS = ("graph", "coverage", "setup", "search", "read", "other")
+IDLE_GAP = timedelta(minutes=30)
+ISSUE_REF = re.compile(r"^#[0-9]+$")
+
+
+def issue_ref(value):
+    """Accept only an opaque issue number; never persist arbitrary reference text."""
+    if not ISSUE_REF.fullmatch(value):
+        raise argparse.ArgumentTypeError("issue ref must match #<digits>")
+    return value
+
+
+def db_path(root, override=None):
+    return override or os.path.join(root, "runs", "token-usage", "annotations.sqlite")
+
+
+def db_open(root, override=None):
+    path = db_path(root, override)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    con = sqlite3.connect(path)
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "annotations" in tables:
+        columns = {r[1] for r in con.execute("PRAGMA table_info(annotations)")}
+        if "task_key" in columns:
+            if "legacy_annotations_v1" not in tables:
+                con.execute("ALTER TABLE annotations RENAME TO legacy_annotations_v1")
+            else:
+                con.execute("""INSERT OR REPLACE INTO legacy_annotations_v1
+                    (task_key, ref, task_type, result, first_pass, note, updated_at)
+                    SELECT task_key, ref, task_type, result, first_pass, note, updated_at
+                    FROM annotations""")
+                con.execute("DROP TABLE annotations")
+    con.execute("""CREATE TABLE IF NOT EXISTS annotations (
+        task_instance_id TEXT PRIMARY KEY,
+        window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+        ref TEXT, task_type TEXT, result TEXT NOT NULL, first_pass TEXT,
+        updated_at TEXT NOT NULL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS task_instances (
+        task_instance_id TEXT PRIMARY KEY,
+        bucket TEXT NOT NULL, branch TEXT,
+        window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""")
+    con.execute("PRAGMA user_version = 2")
+    con.commit()
+    return con
+
+
+def legacy_annotation_count(con):
+    exists = con.execute("""SELECT 1 FROM sqlite_master
+        WHERE type='table' AND name='legacy_annotations_v1'""").fetchone()
+    return con.execute("SELECT COUNT(*) FROM legacy_annotations_v1").fetchone()[0] if exists else 0
+
+
+def persist_instances(con, tasks):
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for iid, task in tasks.items():
+        if iid == "other":
+            continue
+        con.execute("""INSERT INTO task_instances
+            (task_instance_id, bucket, branch, window_start, window_end, updated_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(task_instance_id) DO UPDATE SET
+              bucket=excluded.bucket, branch=excluded.branch,
+              window_start=excluded.window_start, window_end=excluded.window_end,
+              updated_at=excluded.updated_at""",
+            (iid, task["bucket"], task["branch"], task["instance_first"].isoformat(),
+             task["instance_last"].isoformat(), now))
+    con.commit()
+
+
+def lookup_kind(name, args):
+    args = args if isinstance(args, dict) else {}
+    tool = name.rsplit("__", 1)[-1]
+    command = str(args.get("command", ""))
+    if name in RUN_TOOLS:
+        cli = re.search(r"\bcodebase-memory-mcp\s+cli\s+(?:(?:--quiet|--json|--progress|--verbose)\s+)*(\w+)", command)
+        if cli:
+            tool = cli.group(1)
+    if tool in GRAPH_QUERIES:
+        return "graph"
+    if tool in GRAPH_SETUP:
+        return "setup"
+    if tool == "check_index_coverage":
+        return "coverage"
+    if name in {"Grep", "Glob"} or (name in RUN_TOOLS and re.search(r"(?:^|[\s;&|])(?:rg|grep|find|git\s+grep)\s", command)):
+        return "search"
+    if name == "Read" or (name in RUN_TOOLS and re.search(r"(?:^|[\s;&|])(?:cat|head|tail|sed|awk)\s", command)):
+        return "read"
+    return "other"
+
+
+def result_measure(block):
+    content = block.get("content", "")
+    text = content if isinstance(content, str) else "".join(
+        part.get("text", "") for part in (content if isinstance(content, list) else [])
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str))
+    # Store counts only. Tool output can contain source, prompts, paths, or credentials.
+    return {"chars": len(text), "error": bool(block.get("is_error")) or '"isError":true' in text.replace(" ", ""),
+            "empty": bool(re.search(r"(?:results|rows):\s*0\b|\"(?:results|rows)\"\s*:\s*\[\s*\]", text))}
+
+
+def stage_for_record(rec):
+    """Classify one assistant message into one coarse, mutually-exclusive work stage."""
+    names = set(rec["tools"])
+    if rec["test"]:
+        return "test"
+    if names & EDIT_TOOLS:
+        return "edit"
+    if names & EXPLORE_TOOLS or any(lookup_kind(name, {}) in {"graph", "coverage", "setup"} for name in names):
+        return "explore"
+    if names & RUN_TOOLS:
+        return "run"
+    if names & AGENT_TOOLS:
+        return "agent"
+    return "other"
+
+
+def make_instance_id(bucket, branch, session_group, started_at):
+    """Stable opaque ID: useful dimensions stay readable; raw session identity does not."""
+    fingerprint = hashlib.sha256(
+        (session_group + "\0" + started_at.isoformat()).encode("utf-8")
+    ).hexdigest()[:10]
+    stamp = started_at.strftime("%Y%m%dT%H%M%S")
+    return "%s@%s#%s-%s" % (bucket, branch or "-", stamp, fingerprint)
+
+
+def summarize_instance(records, visible, bucket, branch, inferred, session_group,
+                       instance_id=None):
+    """Aggregate the in-window part of one pre-segmented task instance."""
+    visible = sorted(visible, key=lambda r: r["ts"])
+    full = sorted(records, key=lambda r: r["ts"])
+    t = {
+        "task_instance_id": instance_id or make_instance_id(
+            bucket, branch, session_group, full[0]["ts"]),
+        "bucket": bucket, "branch": branch, "inferred": inferred,
+        "sessions": {session_group},
+        "first": visible[0]["ts"], "last": visible[-1]["ts"],
+        "instance_first": full[0]["ts"], "instance_last": full[-1]["ts"],
+        "input": 0, "output": 0, "models": defaultdict(int),
+        "cache_read": 0, "cache_creation": 0,
+        "lookups": {kind: {"calls": 0, "result_chars": 0, "errors": 0, "empty": 0, "unmatched": 0} for kind in LOOKUP_KINDS},
+        "first_lookup": None, "first_lookup_at": None,
+        "explore": 0, "edit": 0, "run": 0, "agent": 0,
+        "test": False, "messages": 0, "stage_sequence": [],
+        "stage_tokens": defaultdict(int), "stage_events": [],
+    }
+    for rec in visible:
+        t["input"] += rec["inp"]
+        t["output"] += rec["out"]
+        t["cache_read"] += rec.get("cache_read", 0)
+        t["cache_creation"] += rec.get("cache_creation", 0)
+        t["messages"] += 1
+        t["models"][rec["model"]] += rec["out"]
+        for name, n in rec["tools"].items():
+            if name in EXPLORE_TOOLS or lookup_kind(name, {}) in {"graph", "coverage", "setup"}:
+                t["explore"] += n
+            elif name in EDIT_TOOLS:
+                t["edit"] += n
+            elif name in RUN_TOOLS:
+                t["run"] += n
+            elif name in AGENT_TOOLS:
+                t["agent"] += n
+        for kind, result in rec.get("lookups", []):
+            counts = t["lookups"][kind]
+            counts["calls"] += 1
+            if result is None:
+                counts["unmatched"] += 1
+            else:
+                counts["result_chars"] += result["chars"]
+                counts["errors"] += result["error"]
+                counts["empty"] += result["empty"]
+            if t["first_lookup"] is None and kind in {"graph", "search"}:
+                t["first_lookup"], t["first_lookup_at"] = kind, rec["ts"].isoformat()
+        t["test"] = t["test"] or rec["test"]
+        stage = stage_for_record(rec)
+        if not t["stage_sequence"] or t["stage_sequence"][-1] != stage:
+            t["stage_sequence"].append(stage)
+        t["stage_tokens"][stage] += rec["inp"] + rec["out"]
+        t["stage_events"].append((rec["ts"], stage))
+    t["stage_tokens"] = dict(t["stage_tokens"])
+    return t
+
+
+def collect_tasks(claude_dir, since, until, root, repo_ids):
+    """Dedup Claude entries, then split task instances by session and >30m idle gaps."""
+    if not os.path.isdir(claude_dir):
+        return None, 0
+    best = {}
+    results = {}
+    files_seen = 0
+    since_epoch = datetime.combine(since, datetime.min.time()).timestamp()
+    for proj in sorted(os.listdir(claude_dir)):
+        pdir = os.path.join(claude_dir, proj)
+        if not os.path.isdir(pdir):
+            continue
+        for dirpath, _dirs, filenames in os.walk(pdir):
+            for name in filenames:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(dirpath, name)
+                files_seen += 1
+                try:
+                    if os.stat(path).st_mtime < since_epoch:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    fh = open(path, encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                with fh:
+                    for line in fh:
+                        try:
+                            o = json.loads(line)
+                        except ValueError:
+                            continue
+                        msg = o.get("message") or {}
+                        sid = o.get("sessionId")
+                        session_group = sid or "file:" + hashlib.sha256(
+                            os.path.abspath(path).encode("utf-8")).hexdigest()
+                        if o.get("type") == "user":
+                            for block in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
+                                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id"):
+                                    result_key = (session_group, block["tool_use_id"])
+                                    measured = result_measure(block)
+                                    if measured["chars"] >= results.get(result_key, {}).get("chars", -1):
+                                        results[result_key] = measured
+                            continue
+                        if o.get("type") != "assistant":
+                            continue
+                        usage = msg.get("usage")
+                        if not usage:
+                            continue
+                        ts = _tur.parse_iso(o.get("timestamp"))
+                        if ts is None:
+                            continue
+                        key = (session_group, o.get("requestId") or o.get("uuid"),
+                               msg.get("id") or "")
+                        out = usage.get("output_tokens") or 0
+                        cur = best.get(key)
+                        if cur is not None and cur["out"] >= out:
+                            continue
+                        tools = defaultdict(int)
+                        lookups = []
+                        test_seen = False
+                        for blk in (msg.get("content") or []):
+                            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                                tname = blk.get("name") or "?"
+                                tools[tname] += 1
+                                lookups.append((lookup_kind(tname, blk.get("input") or {}), blk.get("id")))
+                                if tname in RUN_TOOLS and TEST_HINT.search(
+                                        str((blk.get("input") or {}).get("command", ""))):
+                                    test_seen = True
+                        best[key] = {
+                            "ts": ts, "out": out,
+                            "inp": usage.get("input_tokens") or 0,
+                            "cwd": o.get("cwd"), "sid": sid,
+                            "session_group": session_group,
+                            "model": msg.get("model") or "unknown",
+                            "branch": o.get("gitBranch"), "tools": dict(tools),
+                            "cache_read": usage.get("cache_read_input_tokens") or 0,
+                            "cache_creation": usage.get("cache_creation_input_tokens") or 0,
+                            "lookups": lookups,
+                            "test": test_seen,
+                        }
+    if not best:
+        return None, files_seen
+    grouped = defaultdict(list)
+    repo_paths = _tur.registered_repos(root)
+    other = []
+    for rec in best.values():
+        rec["lookups"] = [(kind, results.get((rec["session_group"], call_id))) for kind, call_id in rec["lookups"]]
+        bucket, inferred = _tur.bucket_for_cwd(rec["cwd"], root, repo_ids, False, repo_paths)
+        rec["inferred"] = inferred
+        if bucket == "other":
+            other.append(rec)
+        else:
+            grouped[(bucket, rec["branch"], rec["session_group"])].append(rec)
+
+    tasks = {}
+    for (bucket, branch, session_group), records in grouped.items():
+        ordered = sorted(records, key=lambda r: r["ts"])
+        segments, current = [], []
+        for rec in ordered:
+            if current and rec["ts"] - current[-1]["ts"] > IDLE_GAP:
+                segments.append(current)
+                current = []
+            current.append(rec)
+        if current:
+            segments.append(current)
+        for segment in segments:
+            visible = [r for r in segment if since <= r["ts"].date() <= until]
+            if not visible:
+                continue
+            t = summarize_instance(
+                segment, visible, bucket, branch,
+                any(r["inferred"] for r in segment), session_group)
+            tasks[t["task_instance_id"]] = t
+
+    # Unrelated projects remain one anonymous aggregate; no per-session instance leaks.
+    visible_other = [r for r in other if since <= r["ts"].date() <= until]
+    if visible_other:
+        t = summarize_instance(
+            other, visible_other, "other", None, False, "anonymous-other", "other")
+        t["sessions"] = {r["session_group"] for r in visible_other}
+        tasks["other"] = t
+    return tasks, files_seen
+
+
+def git_signals(root, repo_ids, task):
+    """Commits/reverts in the task's time window for its bucket's repo. Inferred, not causal."""
+    bucket = task["bucket"]
+    if bucket == "other":
+        return None
+    path = root if bucket == "workspace" else str(_tur.registered_repos(root).get(bucket, os.path.join(root, "repos", bucket)))
+    if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isdir(path):
+        return None
+    lo = (task["first"] - timedelta(minutes=30)).isoformat()
+    hi = (task["last"] + timedelta(minutes=120)).isoformat()
+    # Prefer the task's own branch (accurate); a deleted branch falls back to --all
+    # (coarse — counts every branch in the window; the report labels this scope).
+    for ref, scope in (([task["branch"]], "branch") if task.get("branch") else ([], None),
+                       (["--all"], "all")):
+        if not ref:
+            continue
+        try:
+            r = subprocess.run(["git", "-C", path, "log"] + ref +
+                               ["--since", lo, "--until", hi, "--pretty=%s"],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            continue
+        subjects = [s for s in r.stdout.splitlines() if s.strip()]
+        return {"commits": len(subjects), "scope": scope,
+                "reverts": sum(1 for s in subjects if s.startswith("Revert"))}
+    return None
+
+
+def format_outcome(result, ref=None, task_type=None, first_pass=None):
+    if not result:
+        return None
+    value = result
+    if ref:
+        value += " (%s)" % ref
+    if task_type:
+        value += " · %s" % task_type
+    if first_pass:
+        value += " · 首轮:%s" % first_pass
+    return value
+
+
+def row_for_instance(task_instance_id, task, annotation, git):
+    models = dict(task["models"])
+    top_model = max(models.items(), key=lambda kv: kv[1])[0] if models else "-"
+    ref = annotation.get("ref") if annotation else None
+    result = annotation.get("result") if annotation else None
+    task_type = annotation.get("task_type") if annotation else None
+    first_pass = annotation.get("first_pass") if annotation else None
+    label = task_instance_id + (" `# inferred`" if task["inferred"] else "")
+    return {
+        "task": label, "task_id": ref or task_instance_id,
+        "task_instance_id": task_instance_id,
+        "task_instance_ids": [task_instance_id], "instances": 1,
+        "bucket": task["bucket"], "branch": task["branch"],
+        "sessions": len(task["sessions"]),
+        "first": task["first"].isoformat(), "last": task["last"].isoformat(),
+        "instance_first": task["instance_first"].isoformat(),
+        "instance_last": task["instance_last"].isoformat(),
+        "top_model": top_model, "tokens": task["input"] + task["output"],
+        "input": task["input"], "output": task["output"],
+        "cache_read": task["cache_read"], "cache_creation": task["cache_creation"],
+        "lookups": task["lookups"], "first_lookup": task["first_lookup"], "first_lookup_at": task["first_lookup_at"],
+        "messages": task["messages"],
+        "explore": task["explore"], "edit": task["edit"],
+        "run": task["run"], "agent": task["agent"], "test": task["test"],
+        "stage_sequence": task["stage_sequence"], "stage_tokens": task["stage_tokens"],
+        "git": git, "ref": ref, "task_type": task_type, "result": result,
+        "first_pass": first_pass,
+        "outcome": format_outcome(result, ref, task_type, first_pass),
+        "confidence": "标注" if annotation else
+                      ("推断" if (task["inferred"] or (git and git["commits"] > 0))
+                       else "低(仅自动)"),
+        "_models": models, "_stage_events": task["stage_events"],
+        "_session_keys": set(task["sessions"]),
+    }
+
+
+def merge_annotated_rows(rows):
+    """Rows sharing a non-empty issue ref become one manually confirmed task."""
+    groups = defaultdict(list)
+    for row in rows:
+        key = ("ref", row["ref"]) if row.get("ref") else ("instance", row["task_instance_id"])
+        groups[key].append(row)
+    merged = []
+    for (kind, key), group in groups.items():
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        stage_events = sorted(
+            (event for row in group for event in row["_stage_events"]),
+            key=lambda event: event[0])
+        stage_sequence = []
+        for _ts, stage in stage_events:
+            if not stage_sequence or stage_sequence[-1] != stage:
+                stage_sequence.append(stage)
+        stage_tokens = defaultdict(int)
+        models = defaultdict(int)
+        session_keys = set()
+        for row in group:
+            for stage, tokens in row["stage_tokens"].items():
+                stage_tokens[stage] += tokens
+            for model, tokens in row["_models"].items():
+                models[model] += tokens
+            session_keys.update(row["_session_keys"])
+        top_model = max(models.items(), key=lambda kv: kv[1])[0] if models else "-"
+        git_rows = [row["git"] for row in group if row.get("git")]
+        git = ({"commits": sum(g["commits"] for g in git_rows),
+                "reverts": sum(g["reverts"] for g in git_rows), "scope": "merged"}
+               if git_rows else None)
+        buckets = {row["bucket"] for row in group}
+        branches = {row["branch"] for row in group}
+        results = {row["result"] for row in group if row.get("result")}
+        types = {row["task_type"] for row in group if row.get("task_type")}
+        passes = {row["first_pass"] for row in group if row.get("first_pass")}
+        result = next(iter(results)) if len(results) == 1 else "mixed"
+        task_type = next(iter(types)) if len(types) == 1 else ("mixed" if types else None)
+        first_pass = next(iter(passes)) if len(passes) == 1 else ("mixed" if passes else None)
+        inferred = any("# inferred" in row["task"] for row in group)
+        lookups = {kind: {field: sum(row["lookups"][kind][field] for row in group)
+                          for field in ("calls", "result_chars", "errors", "empty", "unmatched")} for kind in LOOKUP_KINDS}
+        first = min((row for row in group if row["first_lookup_at"]), key=lambda row: row["first_lookup_at"], default=None)
+        merged.append({
+            "task": "%s (%d instances)%s" %
+                    (key, len(group), " `# inferred`" if inferred else ""),
+            "task_id": key, "task_instance_id": None,
+            "task_instance_ids": [row["task_instance_id"] for row in group],
+            "instances": len(group),
+            "bucket": next(iter(buckets)) if len(buckets) == 1 else "multiple",
+            "branch": next(iter(branches)) if len(branches) == 1 else None,
+            "sessions": len(session_keys),
+            "first": min(row["first"] for row in group),
+            "last": max(row["last"] for row in group),
+            "instance_first": min(row["instance_first"] for row in group),
+            "instance_last": max(row["instance_last"] for row in group),
+            "top_model": top_model,
+            "tokens": sum(row["tokens"] for row in group),
+            "input": sum(row["input"] for row in group), "output": sum(row["output"] for row in group),
+            "cache_read": sum(row["cache_read"] for row in group), "cache_creation": sum(row["cache_creation"] for row in group),
+            "lookups": lookups, "first_lookup": first["first_lookup"] if first else None,
+            "first_lookup_at": first["first_lookup_at"] if first else None,
+            "messages": sum(row["messages"] for row in group),
+            "explore": sum(row["explore"] for row in group),
+            "edit": sum(row["edit"] for row in group),
+            "run": sum(row["run"] for row in group),
+            "agent": sum(row["agent"] for row in group),
+            "test": any(row["test"] for row in group),
+            "stage_sequence": stage_sequence, "stage_tokens": dict(stage_tokens),
+            "git": git, "ref": key, "task_type": task_type, "result": result,
+            "first_pass": first_pass,
+            "outcome": format_outcome(result, key, task_type, first_pass),
+            "confidence": "标注", "_models": dict(models),
+            "_stage_events": stage_events, "_session_keys": session_keys,
+        })
+    merged.sort(key=lambda row: -row["tokens"])
+    for row in merged:
+        for private in ("_models", "_stage_events", "_session_keys"):
+            row.pop(private, None)
+    return merged
+
+
+def render(meta, rows):
+    L = []
+    L.append("# 任务实例 Token 关联报告(%s ~ %s)" % (meta["since"], meta["until"]))
+    L.append("")
+    L.append("生成时间:%s。零标注时每行 = 一个自动任务实例(session + 超过 30 分钟空闲切分);"
+             "同分支活动不会再自动合并。Codex 无消息级数据,不在本视图。" % meta["generated_at"])
+    L.append("")
+    L.append("> 每行是**可核验的关联记录,不是评价**;「commits/信号」为时间窗推断,非因果。")
+    L.append("> 本报告不含 prompt、文件路径与用户标识;仅存本机 `runs/`,请勿提交或外发。")
+    if meta.get("legacy_annotations"):
+        L.append("> ⚠ 已保留 %d 条旧版分支簇标注,但不会自动绑定到实例;请人工重新标注。" %
+                 meta["legacy_annotations"])
+    L.append("")
+    L.append("| 任务/实例 | sessions | 窗口 | 主模型 | in+out tokens | 阶段(token) | 行为(读/改/跑/代理) | git 信号 | 结果标注 | 置信度 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        allocation = ", ".join("%s:%s" % (stage, _tur.fmt(tokens))
+                               for stage, tokens in r["stage_tokens"].items())
+        if r["task"] == "other":
+            # The anonymous aggregate spans many unrelated sessions — a stage sequence is
+            # meaningless there and unbounded in length; keep only the token allocation.
+            stages = "(聚合,无序列) %s" % allocation if allocation else "(聚合)"
+        else:
+            seq = r["stage_sequence"]
+            sequence = "→".join(seq[:12]) or "other"
+            if len(seq) > 12:
+                sequence += "→…(+%d)" % (len(seq) - 12)
+            stages = "%s (%s)" % (sequence, allocation) if allocation else sequence
+        L.append("| %s | %d | %s→%s | %s | %s | %s | %d/%d/%d/%d%s | %s | %s | %s |" % (
+            r["task"], r["sessions"], r["first"][:16], r["last"][:16], r["top_model"],
+            _tur.fmt(r["tokens"]), stages,
+            r["explore"], r["edit"], r["run"], r["agent"],
+            " ✚test" if r["test"] else "",
+            ("%d commits%s%s" % (r["git"]["commits"],
+             "(全分支)" if r["git"].get("scope") == "all" else "",
+             ", %d revert⚠" % r["git"]["reverts"] if r["git"]["reverts"] else ""))
+            if r.get("git") else "-",
+            r["outcome"] or "-", r["confidence"]))
+    L.append("")
+    L.append("## Project map pilot")
+    L.append("")
+    L.append("Text characters are not billed tokens. Lookup order does not establish a structural-search violation. "
+             "Project listings and setup probes stay separate. Unmatched results have unknown size.")
+    L.append("")
+    L.append("| Task | First lookup | Graph / coverage / setup calls | Search / read calls | Retrieval text chars | Cache read / creation | Errors / empty / unmatched |")
+    L.append("|---|---|---|---|---|---|---|")
+    for row in rows:
+        counts = row["lookups"]
+        retrieval = sum(counts[k]["result_chars"] for k in ("graph", "coverage", "search", "read"))
+        L.append("| %s | %s | %d / %d / %d | %d / %d | %d | %d / %d | %d / %d / %d |" % (
+            row["task"], row["first_lookup"] or "unavailable", counts["graph"]["calls"], counts["coverage"]["calls"],
+            counts["setup"]["calls"], counts["search"]["calls"], counts["read"]["calls"], retrieval,
+            row["cache_read"], row["cache_creation"], sum(c["errors"] for c in counts.values()),
+            sum(c["empty"] for c in counts.values()), sum(c["unmatched"] for c in counts.values())))
+    L.append("")
+    L.append("补一条结果标注(可选,永远不阻塞报告):")
+    L.append("")
+    L.append("    scripts/token-usage-tasks annotate --instance '<id>' [--instance '<id2>'] --result success|partial|rework --ref '#127'")
+    L.append("")
+    L.append("口径与局限:`skills/token-usage-analysis/references/metrics-guide.md`。")
+    return "\n".join(L) + "\n"
+
+
+def cmd_report(args):
+    root = os.path.abspath(args.workspace_root) if args.workspace_root else os.path.dirname(_HERE)
+    until = datetime.strptime(args.until, "%Y-%m-%d").date() if args.until else date.today()
+    since = datetime.strptime(args.since, "%Y-%m-%d").date() if args.since else until - timedelta(days=13)
+    repo_ids = _tur.workspace_repo_ids(root)
+    tasks, files_seen = collect_tasks(args.claude_dir, since, until, root, repo_ids)
+    if files_seen == 0:
+        print("FAIL: no local session data found (checked %s) — nothing to report" % args.claude_dir)
+        return 2
+    if not tasks:
+        print("FAIL: no task-instance records in the requested window (checked %s) — nothing to report"
+              % args.claude_dir)
+        return 2
+    con = db_open(root, args.db)
+    persist_instances(con, tasks)
+    notes = {}
+    for row in con.execute("""SELECT task_instance_id, window_start, window_end,
+            ref, task_type, result, first_pass FROM annotations"""):
+        notes[row[0]] = {"window_start": row[1], "window_end": row[2], "ref": row[3],
+                         "task_type": row[4], "result": row[5], "first_pass": row[6]}
+    legacy_count = legacy_annotation_count(con)
+    con.close()
+    rows = []
+    for tkey, t in tasks.items():
+        g = git_signals(root, repo_ids, t)
+        note = notes.get(tkey)
+        if note and (note["window_start"] != t["instance_first"].isoformat() or
+                     note["window_end"] != t["instance_last"].isoformat()):
+            note = None
+        rows.append(row_for_instance(tkey, t, note, g))
+    rows = merge_annotated_rows(rows)
+    meta = {"since": since.isoformat(), "until": until.isoformat(),
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "idle_gap_minutes": int(IDLE_GAP.total_seconds() // 60),
+            "legacy_annotations": legacy_count}
+    out_dir = args.out or os.path.join(root, "runs", "token-usage")
+    os.makedirs(out_dir, exist_ok=True)
+    md_path = os.path.join(out_dir, "tasks-%s-%s.md" % (meta["since"], meta["until"]))
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(render(meta, rows))
+    if args.json:
+        with open(md_path[:-3] + ".json", "w", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "tasks": rows}, fh, ensure_ascii=False, indent=2)
+    if args.html or args.open:
+        html_path = _tur.write_html_sibling(
+            md_path, "任务实例 Token 关联报告 %s~%s" % (meta["since"], meta["until"]))
+        print("OK: html written: %s" % html_path)
+        if args.open:
+            _tur.open_local(html_path)
+    print("OK: task report written: %s (%d task rows, %d annotated)" % (
+        md_path, len(rows), sum(1 for r in rows if r["outcome"])))
+    return 0
+
+
+def cmd_annotate(args):
+    root = os.path.abspath(args.workspace_root) if args.workspace_root else os.path.dirname(_HERE)
+    con = db_open(root, args.db)
+    catalog = {}
+    for iid in args.instance:
+        row = con.execute("""SELECT window_start, window_end FROM task_instances
+            WHERE task_instance_id=?""", (iid,)).fetchone()
+        if row is None:
+            con.close()
+            print("FAIL: unknown task_instance_id '%s'; run the report first and copy an ID" % iid)
+            return 2
+        catalog[iid] = row
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for iid, (window_start, window_end) in catalog.items():
+        con.execute("""INSERT INTO annotations
+            (task_instance_id, window_start, window_end, ref, task_type, result, first_pass, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(task_instance_id) DO UPDATE SET
+              window_start=excluded.window_start, window_end=excluded.window_end,
+              ref=excluded.ref, task_type=excluded.task_type, result=excluded.result,
+              first_pass=excluded.first_pass, updated_at=excluded.updated_at""",
+            (iid, window_start, window_end, args.ref, args.type, args.result,
+             args.first_pass, now))
+    con.commit()
+    con.close()
+    print("OK: annotation saved for %d task instance(s) (structured labels only, local sqlite)" %
+          len(catalog))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd")
+    rp = sub.add_parser("report", help="build the task-attributed view (default)")
+    an = sub.add_parser("annotate", help="attach an outcome label to one or more task instances")
+    for p in (rp, an):
+        p.add_argument("--workspace-root")
+        p.add_argument("--db", help="annotations sqlite path override (default: <root>/runs/token-usage/annotations.sqlite)")
+    rp.add_argument("--since"); rp.add_argument("--until")
+    rp.add_argument("--json", action="store_true")
+    rp.add_argument("--html", action="store_true",
+                    help="also render a local self-contained HTML beside the markdown")
+    rp.add_argument("--open", action="store_true",
+                    help="open the HTML in the default viewer (implies --html; local file only)")
+    rp.add_argument("--out")
+    rp.add_argument("--claude-dir", default=os.path.expanduser("~/.claude/projects"))
+    an.add_argument("--instance", action="append", required=True,
+                    help="task_instance_id from a prior report; repeat to merge by --ref")
+    an.add_argument("--result", required=True, choices=["success", "partial", "rework", "abandoned"])
+    an.add_argument("--ref", type=issue_ref,
+                    help="issue/PR number in #<digits> form, e.g. '#120'")
+    an.add_argument("--type", choices=["implementation", "review", "research", "structural", "debug",
+                                        "docs", "ops", "other"])
+    an.add_argument("--first-pass", choices=["yes", "no"])
+    args = ap.parse_args()
+    if args.cmd == "annotate":
+        return cmd_annotate(args)
+    if args.cmd is None:
+        args = rp.parse_args(sys.argv[1:])
+    return cmd_report(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

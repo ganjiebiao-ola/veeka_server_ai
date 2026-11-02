@@ -1,0 +1,68 @@
+name: Security patch sandbox
+
+# The scanner image takes about 3.5 minutes to build without a cache, and only the Codex Docker
+# sandbox test uses it. So this runs only when an input of the image or of that test changes.
+on:
+  pull_request:
+    paths:
+      - suites/security-patch/app/scanner/**
+      - suites/security-patch/app/skill/**
+      - suites/security-patch/app/backend/docker/**
+      - .github/workflows/security-patch-sandbox.yml
+  push:
+    branches: [main]
+    paths:
+      - suites/security-patch/app/scanner/**
+      - suites/security-patch/app/skill/**
+      - suites/security-patch/app/backend/docker/**
+      - .github/workflows/security-patch-sandbox.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox:
+    name: Scanner image sandbox test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Load confined sandbox test profile
+        run: sudo apparmor_parser -r -W suites/security-patch/app/backend/docker/codex-test-apparmor
+      - uses: docker/setup-buildx-action@v3
+      # The GitHub Actions cache keeps the apt, PHP, Semgrep and CLI layers, so a change to the
+      # scanner code rebuilds only the COPY layers. A change to one build stage rebuilds that stage
+      # and the final stage.
+      - name: Build the scanner image
+        uses: docker/build-push-action@v6
+        with:
+          context: suites/security-patch/app
+          file: suites/security-patch/app/scanner/Dockerfile
+          tags: ola-agent-scanner:test
+          load: true
+          cache-from: type=gha,scope=scanner
+          cache-to: type=gha,scope=scanner,mode=max
+      # The unit tests rewrite the bridge.mjs imports, so only the image shows a missing file.
+      # With no MODEL, the bridge exits with "No model" after all its imports load.
+      - name: Check that bridge.mjs loads in the image
+        run: |
+          out="$(docker run --rm -i --entrypoint bun ola-agent-scanner:test /opt/bridge.mjs </dev/null 2>&1)" || true
+          printf '%s\n' "$out"
+          case "$out" in *'No model'*) ;; *) echo "FAIL: bridge.mjs did not load in the image"; exit 1 ;; esac
+      - name: Run the Docker sandbox test
+        working-directory: suites/security-patch/app
+        env:
+          CODEX_SANDBOX_TEST: "1"
+          CODEX_SANDBOX_APPARMOR: "1"
+        # The test skips itself without CODEX_SANDBOX_TEST. Refuse a green run where it skipped.
+        run: |
+          out="$(bun test ./scanner/entrypoint.test.mjs -t "Codex Docker sandbox" 2>&1)"; rc=$?
+          printf '%s\n' "$out"
+          [ "$rc" = 0 ] || exit "$rc"
+          case "$out" in *" 1 pass"*) ;; *) echo "FAIL: the Docker sandbox test did not run"; exit 1 ;; esac

@@ -1,0 +1,27 @@
+{
+ "schema_version": 1,
+ "id": "2026-08-alice-claude-seat",
+ "created_at": "2026-07-28T10:00:00+08:00",
+ "human_id": "alice",
+ "team": "fixture-team",
+ "kind": "new",
+ "resource": "Claude Team seat",
+ "business": "fixture-biz",
+ "project": "alpha",
+ "purpose": "p",
+ "outcome": "两周内完成探测重构 PR",
+ "amount": 200,
+ "currency": "USD",
+ "start": "2026-08-01",
+ "end": "2026-08-31",
+ "renewal": "monthly",
+ "allocation": "single",
+ "split": [],
+ "note": "",
+ "status": "purchased",
+ "bill_refs": [
+  "ledger 2026-08"
+ ],
+ "review_before_renewal": null,
+ "workspace_sha": ""
+}

@@ -1,0 +1,111 @@
+# Ola Security Agent — local docker-compose deployment.
+#
+# Usage:
+#   ./scripts/dev.sh compose:start    # exports OAuth creds + docker compose up
+#   docker compose logs -f            # tail
+#   ./scripts/dev.sh compose:stop     # docker compose down + scanner cleanup
+#
+# Layout:
+#   backend  → Bun + Hono API on :37018
+#   frontend → nginx serving Vite build on :32088 (proxies /api to backend)
+#   scanner  → pre-built image (ola-agent-scanner:latest), spawned by backend
+#              on demand as sibling containers via host docker.sock.
+
+services:
+  backend:
+    container_name: ola-agent-backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:37018:37018"
+    environment:
+      # Listen across the container network, with host access restricted above.
+      OLA_AGENT_BIND_HOST: 0.0.0.0
+      OLA_AGENT_UI_ORIGINS: ${OLA_AGENT_UI_ORIGINS:-http://localhost:32088,http://127.0.0.1:32088}
+      # Host filesystem path the backend tells `docker run` to bind-mount as
+      # /root/.claude/.credentials.json:ro inside scanner containers. We
+      # identity-mount the same path inside this backend container so the
+      # path travels unchanged when this process spawns siblings.
+      OLA_AGENT_CREDENTIALS_HOST_PATH: ${PWD}/.runtime/.credentials.json
+      # Scanner image tag; built separately (scanner/Dockerfile).
+      OLA_AGENT_SCANNER_IMAGE: ola-agent-scanner:latest
+      # Scanner artifacts root — identity-mounted below.
+      OLA_AGENT_RUNS_ROOT: ${PWD}/backend/workspace/runs
+      OLA_AGENT_DB_PATH:   ${PWD}/backend/data/ola-agent.sqlite
+      OLA_AGENT_ENV_PATH: /config/.env
+      OLA_AGENT_CONTEXT_ROOT: /workspace-context
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-5}
+      # Per-scanner container caps; unset = the built-in 2 CPU / 4096 MB.
+      OLA_AGENT_SCANNER_CPUS: ${OLA_AGENT_SCANNER_CPUS:-}
+      OLA_AGENT_SCANNER_MEMORY_MB: ${OLA_AGENT_SCANNER_MEMORY_MB:-}
+      OLA_AGENT_SCANNER_MEMORY_SWAP_MB: ${OLA_AGENT_SCANNER_MEMORY_SWAP_MB:-}
+      # Per-run relay channel (#12). Without these forwards the backend container
+      # never sees the host .env values and relay runs are rejected as
+      # "not configured".
+      OLA_AGENT_RELAY_BASE_URL: ${OLA_AGENT_RELAY_BASE_URL:-}
+      OLA_AGENT_RELAY_AUTH_TOKEN: ${OLA_AGENT_RELAY_AUTH_TOKEN:-}
+      OLA_AGENT_RELAY_MODEL: ${OLA_AGENT_RELAY_MODEL:-}
+      # Git auth for cloning, pushing and the issue tracker.
+      GH_TOKEN: ${GH_TOKEN:-}
+      OLA_AGENT_GH_TOKEN: ${OLA_AGENT_GH_TOKEN:-}
+      # Claude auth. Three providers, in precedence order:
+      #   1. settings mode (OLA_AGENT_AUTH_MODE=settings): follow the host
+      #      ~/.claude/settings.json provider (cc-switch) — base URL + token
+      #      forwarded below. scripts/dev.sh exports these from settings.json.
+      #   2. API key: ANTHROPIC_API_KEY set → official endpoint, no refresh.
+      #   3. OAuth: docker-compose.server.yml mounts the host's
+      #      ~/.claude/.credentials.json and points OLA_AGENT_CREDENTIALS_SOURCE
+      #      at it; the per-run refresh writes the slice to .runtime below.
+      # In modes 1/2 the backend ignores OLA_AGENT_CREDENTIALS_HOST_PATH, so no
+      # OAuth file is mounted into scanners.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OLA_AGENT_AUTH_MODE: ${OLA_AGENT_AUTH_MODE:-}
+      OLA_AGENT_CREDENTIALS_SOURCE: ${OLA_AGENT_CREDENTIALS_SOURCE:-}
+      # Generic headless runs (SkillOpt et al). Both unset → feature off.
+      # WORKSPACES_ROOT prefixes are HOST paths (scanners bind-mount them);
+      # CHOWN is the uid:gid scanners hand workspace files back to on exit.
+      OLA_AGENT_WORKSPACES_ROOT: ${OLA_AGENT_WORKSPACES_ROOT:-}
+      OLA_AGENT_WORKSPACE_CHOWN: ${OLA_AGENT_WORKSPACE_CHOWN:-}
+      HOME: /root
+      IS_SANDBOX: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ./.env
+        target: /config/.env
+        bind:
+          create_host_path: false
+      # Identity-mount the .runtime / workspace / data dirs so paths the
+      # backend passes to `docker run` resolve identically on host + container.
+      # .runtime must be RW: the per-run OAuth refresh writes the credential
+      # slice here (.runtime/.credentials.json) for scanner containers to mount.
+      - ${PWD}/.runtime:${PWD}/.runtime
+      - ${PWD}/backend/workspace:${PWD}/backend/workspace
+      - ${PWD}/backend/data:${PWD}/backend/data
+      # Expose context sources to the backend, which selects references for each run.
+      - ../../../workspace.yaml:/workspace-context/workspace.yaml:ro
+      - ../../../agent-instructions/security-defaults.md:/workspace-context/agent-instructions/security-defaults.md:ro
+      - ../../../team-context/security-defaults.team.md:/workspace-context/team-context/security-defaults.team.md:ro
+      - ../../../team-context/mounted-repos:/workspace-context/team-context/mounted-repos:ro
+      - ../../../knowledge:/workspace-context/knowledge:ro
+      - ../../../rules:/workspace-context/rules:ro
+
+  frontend:
+    container_name: ola-agent-frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "32088:80"
+    depends_on:
+      backend:
+        condition: service_healthy

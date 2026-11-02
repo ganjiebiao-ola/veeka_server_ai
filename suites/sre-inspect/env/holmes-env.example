@@ -1,0 +1,23 @@
+# suites/sre-inspect/env/.env.holmes — the ONLY credential carrier of this suite.
+# Copy this file to env/.env.holmes (gitignored by the workspace's `.env.*` rule) and `chmod 600` it.
+# A value left as <placeholder> counts as unset.
+# `run doctor` checks presence and mode; nothing in the suite ever prints a value.
+#
+# Consumers: `run` (loads it), holmes/docker-compose.yaml (env_file), the mcp-grafana stdio config
+# printed by `run mcp-config` (reads your shell environment: `set -a; . env/.env.holmes; set +a`).
+
+# Department Grafana — must equal tenant.yaml grafana.url
+GRAFANA_URL=https://grafana.example.internal
+# Service-account token (Viewer role is enough: datasources:query, alert.rules:read, dashboards:read)
+GRAFANA_SERVICE_ACCOUNT_TOKEN=<paste-the-service-account-token>
+GRAFANA_ORG_ID=1
+
+# Bearer the mcp-grafana sidecar requires from callers (any random string; only Holmes in the same
+# compose network presents it). Unauthenticated non-loopback listeners are being deprecated upstream.
+MCP_GRAFANA_SERVER_TOKEN=<any-random-string>
+
+# Only for the optional local HolmesGPT (holmes/docker-compose.yaml). Holmes reads the LLM key as
+# OPENAI_API_KEY for openai/-prefixed models (its root-level api_key does not interpolate env);
+# HOLMES_API_KEY protects its own HTTP API. Both stay unset unless you run the local instance.
+OPENAI_API_KEY=<optional>
+HOLMES_API_KEY=<optional>

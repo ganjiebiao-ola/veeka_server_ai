@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Roll-up: every generated file (platform-internals/ownership.yaml `generated:`) matches its sources.
+
+Runs scripts/render-agent-entries --check and scripts/render-context-manifest --check; exit 1 if either
+is stale. Wired into `ws test` and `ws health`. Zero-dependency. argv[1] optionally overrides the root.
+"""
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
+here = pathlib.Path(__file__).resolve().parent
+PY = sys.executable or "python3"
+failed = False
+for script in ("render-agent-entries", "render-context-manifest"):
+    r = subprocess.run([PY, str(here / script), "--check", str(root)], capture_output=True, text=True)
+    for ln in (r.stdout + r.stderr).strip().splitlines():
+        print(("  - " if r.returncode != 0 else "  ") + ln)
+    failed = failed or r.returncode != 0
+print("FAIL: generated files stale" if failed else "OK: generated files match their sources")
+sys.exit(1 if failed else 0)

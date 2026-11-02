@@ -1,0 +1,27 @@
+{
+  "incident": "INC-20260101-000000-deadbeef",
+  "checks": [
+    {
+      "name": "php -l app/service/ExampleSrv.php",
+      "passed": true,
+      "output": "No syntax errors detected in app/service/ExampleSrv.php",
+      "command": "php7.2 -l app/service/ExampleSrv.php"
+    },
+    {
+      "name": "isFeatureEnabled call-site uniqueness check",
+      "passed": true,
+      "output": "cli/run.php:5: echo ExampleSrv::isFeatureEnabled(...)",
+      "command": "grep -rn 'isFeatureEnabled' cli/ app/",
+      "note": "Confirmed single call site at cli/run.php:5"
+    },
+    {
+      "name": "no PHPUnit tests found for ExampleSrv",
+      "passed": true,
+      "output": "No test directory exists in the seed repository",
+      "command": "find . -type d -name 'test*'"
+    }
+  ],
+  "all_passed": true,
+  "php_binary": "php7.2 (project targets PHP 7.2 per composer.json)",
+  "notes": "Fix applied to app/service/ExampleSrv.php only. See FIXNOTES.md for rationale."
+}

@@ -1,0 +1,51 @@
+{
+  "summary": "本周聚焦企微机器人可靠性与外宣派发链路；两个核心交付均已提交，AI 参与了状态探测重构与 23 个文件的派发流程改造。",
+  "projects": [
+    {
+      "name": "<mounted-repo-id or a project name>",
+      "headline": "企微机器人可靠性与群投递",
+      "status": [
+        "已提交",
+        "专项验证通过"
+      ],
+      "value": "高",
+      "tasks": [
+        {
+          "title": "企微退出、登录态异常与机器人心跳处理",
+          "detail": "发送群消息期间加入 UI 锁；连续 3 次探测失败停跳并报警；进程退出秒级阻断心跳。",
+          "evidence": "commits e0f9ccb, ce4d293 (2026-09-11); 单测 tests.test_group_heartbeat 通过",
+          "ai_role": "起草单测 + 改写探测逻辑",
+          "deliverable": "PR (commits e0f9ccb, ce4d293)",
+          "status": "已提交"
+        }
+      ],
+      "risks": [
+        "部署验证：需线上真实环境确认多分支生效"
+      ]
+    }
+  ],
+  "reusable_methods": [
+    "先让 AI 写单测再改探测逻辑，一次通过率明显提高"
+  ],
+  "failed_experiments": [
+    "让 AI 直接改 5 个分支的重试策略，改出并发冲突，回滚后改为逐分支"
+  ],
+  "issues": [
+    "Codex 额度周四用尽，下午切到 Claude"
+  ],
+  "next_actions": [
+    {
+      "priority": "high",
+      "item": "核对机器人线上版本与预警效果",
+      "acceptance": "线上验证退出、登录异常与长任务场景"
+    },
+    {
+      "priority": "mid",
+      "item": "补齐首充 QA 边界用例",
+      "acceptance": "覆盖加好友限制与活动时间拦截"
+    }
+  ],
+  "resource_needs": [
+    "Codex 额度不足:周四即用尽,申请增加 20%"
+  ]
+}

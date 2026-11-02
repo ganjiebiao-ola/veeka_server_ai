@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# [stub] campaign-stub test entry — self-contained consistency check, no manifest parsing.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+suite=$(basename "$here")
+grep -q "^id: $suite\$" "$here/SUITE.md" || { echo "[stub] FAIL: SUITE.md id != $suite" >&2; exit 1; }
+grep -q "^entry: platform-internals/suites/$suite/\$" "$here/SUITE.md" || { echo "[stub] FAIL: SUITE.md entry != platform-internals/suites/$suite/" >&2; exit 1; }
+echo "[stub] campaign-stub: test — SUITE.md id/entry consistent, ok"
+exit 0

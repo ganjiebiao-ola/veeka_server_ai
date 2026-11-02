@@ -1,0 +1,44 @@
+# platform-internals/ownership.yaml — who owns which path (framework | seed | generated | team)
+#
+# One owner per path; longest-prefix match (a trailing `/` matches the whole subtree); anything not
+# listed is `team`. Checked by scripts/check-ownership (`ws health`). Rationale and the sync flow:
+# agent-instructions/mount-points.md § "Ownership: template vs team".
+version: 1
+
+# Shipped by the template and kept byte-identical downstream. Change these UPSTREAM first (a
+# contrib/* branch cut from the template's main), then sync — never edit them in a team workspace.
+framework:
+  - .gitattributes
+  - .gitignore
+  - .claude/
+  - .agents/
+  - .codex/
+  - CHANGELOG.md
+  - agent-instructions/
+  - platform-internals/
+  - scripts/
+  - skills/            # every git-tracked skill under skills/ is a bundled skill; team skills live in team-context/skills/
+  - suites/            # suite code, docs, tests, SUITE.md; the operator's copy is the gitignored *.local.yaml
+  - repos/README.md
+  - team-context/README.md
+  - team-context/manifest.d/00-template.yaml
+
+# Shipped once, team-owned thereafter. `.gitattributes` marks them merge=ours, so a sync keeps the team's
+# copy; template-side changes to a seed are announced in CHANGELOG.md for teams to adopt by hand.
+seed:
+  - README.md
+  - README.en.md
+  - workspace.yaml
+  - rules/
+  - team-context/security-defaults.team.md
+  - team-context/agent-entry.team.md
+  - team-context/manifest.d/50-team.yaml
+  - team-context/freshness-log.md
+  - knowledge/README.md   # shipped as a stub; becomes the team's own knowledge index
+  - knowledge/maps/overview.md   # shipped as a stub; becomes the team's own project map
+
+# Rendered from framework skeletons + team files by scripts/render-*; merge=ours on sync, then re-rendered.
+generated:
+  - CLAUDE.md
+  - AGENTS.md
+  - team-context/manifest.yaml

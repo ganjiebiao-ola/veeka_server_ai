@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olaola-chat/ai-native-workspace-template/platform-internals/schemas/workspace.schema.json",
+  "title": "Workspace declaration (workspace.yaml), #50",
+  "description": "Machine contract for workspace.yaml, validated by `scripts/ws validate` (via scripts/check-workspace, zero-dependency hand-walk — no pyyaml/jsonschema). `required` lists the top-level keys a compliant workspace.yaml must declare; `x_required_paths` (a non-standard extension consumed by check-workspace) lists the skeleton files/dirs a compliant workspace must contain — the usage surface plus `platform-internals/`, the self-proving layer that makes a green `ws health` mean something. `suites/` left this list in #93: the SUITE contract and the stub moved into `platform-internals/suites/`, and a top-level `suites/` comes back as a mount point when the first real suite ships (#43). The manifest field slot is co-owned by #41/#50; #50 fills the machine-validation half. `team-context/manifest.yaml` is required so a workspace missing the Context Manifest fails `validate` with a clear message instead of failing `health` obscurely.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["owner", "team", "repositories", "repo_catalog", "agent_suites", "required_local_permissions"],
+  "properties": {
+    "owner": { "type": "string", "description": "human owner (accountability; no agent identity)" },
+    "team": { "type": "string" },
+    "repositories": { "type": "array", "description": "frozen placeholder — always [], required so the key stays present; the real per-developer mount list ({id, path}) lives in workspace.local.yaml (gitignored)" },
+    "repo_catalog": { "type": "object", "description": "the team's real repos tagged by role, {org, repos:[{id,roles}]}. Required — scripts/setup-repos hard-depends on it and aborts with `FAIL: no repo_catalog found` if absent." },
+    "agent_suites": { "type": "array", "description": "mounted vertical suites, {id, source, version, entry}" },
+    "required_local_permissions": { "type": "array", "description": "{mechanism, check, guide} entries (or legacy plain strings)" },
+    "known_limitations": { "type": "array" },
+    "skill_catalog": { "type": "object", "description": "curated always-mounted skills selected from inside a skills-source monorepo, {source, skills:[{id,category,roles}]}. Optional — the long tail stays discoverable on demand instead of pre-mounted." },
+    "upstream": { "type": "object", "description": "the template this workspace was instantiated from: {url, branch, synced_commit}. Optional (absent in the template itself). synced_commit is the full sha of the upstream commit the framework-owned paths currently match — scripts/check-ownership compares against it, scripts/upstream-pin bumps it on every sync. Ownership classes: platform-internals/ownership.yaml." }
+  },
+  "x_required_paths": [
+    "CLAUDE.md",
+    "AGENTS.md",
+    "workspace.yaml",
+    "agent-instructions/security-defaults.md",
+    "rules/team-rules.md",
+    "agent-instructions/",
+    "rules/",
+    "skills/",
+    "knowledge/",
+    "repos/",
+    "platform-internals/",
+    "team-context/manifest.yaml",
+    "platform-internals/ownership.yaml",
+    ".gitattributes",
+    "platform-internals/templates/",
+    "team-context/manifest.d/00-template.yaml",
+    "team-context/manifest.d/50-team.yaml",
+    "team-context/security-defaults.team.md",
+    "team-context/agent-entry.team.md"
+  ]
+}

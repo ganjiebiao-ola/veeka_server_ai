@@ -1,0 +1,46 @@
+{
+  "actual": {
+    "amount": 200.0,
+    "currency": "USD",
+    "nature": "seat",
+    "source": "subscription-ledger 2026-09",
+    "period": {
+      "since": "2026-09-01",
+      "until": "2026-09-30"
+    },
+    "confirmed": true
+  },
+  "allocated": {
+    "amount": 46.67,
+    "currency": "USD",
+    "nature": "seat",
+    "source": "subscription-ledger 2026-09",
+    "period": {
+      "since": "2026-09-07",
+      "until": "2026-09-13"
+    },
+    "confirmed": true,
+    "basis": "月费按服务周期折算到报告周 (7/30)"
+  },
+  "allocation": [
+    {
+      "target": "<mounted-repo-id>",
+      "ratio": 70
+    },
+    {
+      "target": "workspace",
+      "ratio": 30
+    }
+  ],
+  "shared_costs": [
+    {
+      "description": "team GPU box, 2h",
+      "amount": 3.2,
+      "currency": "USD"
+    }
+  ],
+  "confirmed_by": {
+    "billing": "<billing-owner human_id>",
+    "attribution": "<attribution-owner human_id>"
+  }
+}

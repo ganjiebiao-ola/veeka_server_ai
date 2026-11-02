@@ -1,0 +1,7 @@
+[
+ {"id": 1, "uid": "dsprom00000001", "name": "prom-cms", "type": "prometheus", "url": "https://prom.example.internal/cms", "jsonData": {"httpMethod": "POST"}},
+ {"id": 2, "uid": "dsprom00000002", "name": "prom-app", "type": "prometheus", "url": "https://prom.example.internal/app", "jsonData": {}},
+ {"id": 3, "uid": "dssls000000001", "name": "log_nginx_access", "type": "aliyun-log-service-datasource", "url": "https://region.log.example", "isDefault": true, "jsonData": {"project": "app-logs", "logstore": "nginx-access", "international": false}},
+ {"id": 4, "uid": "dssls000000002", "name": "log_app", "type": "aliyun-log-service-datasource", "url": "https://region.log.example", "jsonData": {"project": "app-logs", "logstore": "app"}},
+ {"id": 5, "uid": "dsother0000001", "name": "Tracing", "type": "tempo", "url": "https://tempo.example", "jsonData": {}}
+]

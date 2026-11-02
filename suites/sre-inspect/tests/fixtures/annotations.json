@@ -1,0 +1,15 @@
+[
+ {"id": 1, "alertId": 1, "alertName": "API | 5XX", "newState": "Alerting", "prevState": "Pending", "time": 1787836890000, "timeEnd": 1787836890000,
+  "text": "API | 5XX {alertname=API | 5XX, api=/v1/orders, environment=production, severity=critical, status=500} - B=3.000000, C=1.000000", "data": {"values": {"B": 3, "C": 1}}},
+ {"id": 2, "alertId": 1, "alertName": "API | 5XX", "newState": "Normal", "prevState": "Alerting", "time": 1787837190000, "timeEnd": 1787837190000,
+  "text": "API | 5XX {alertname=API | 5XX, api=/v1/orders, environment=production, severity=critical, status=500} - B=0.000000, C=0.000000"},
+ {"id": 3, "alertId": 1, "alertName": "NSQ | Congested Channel", "newState": "Alerting", "prevState": "Pending", "time": 1787840000000, "timeEnd": 1787840000000,
+  "text": "NSQ | Congested Channel {alertname=NSQ | Congested Channel, environment=production, severity=warning, topic=orders.created:default} - B=1200.000000"},
+ {"id": 4, "alertId": 1, "alertName": "DTS | Sync Delay", "newState": "Alerting (NoData)", "prevState": "Normal", "time": 1787841000000, "timeEnd": 1787841000000,
+  "text": "DTS | Sync Delay {alertname=DTS | Sync Delay, environment=production, instance=[no value], severity=critical} - B=-1.000000"},
+ {"id": 5, "alertId": 1, "alertName": "Milestone Event", "newState": "Alerting", "prevState": "Normal", "time": 1787842000000, "timeEnd": 1787842000000,
+  "text": "Milestone Event {alertname=Milestone Event, environment=production, product=app, severity=info} - B=1.000000"},
+ {"id": 6, "alertId": 1, "alertName": "Duplicate Title", "newState": "Alerting", "prevState": "Normal", "time": 1787843000000, "timeEnd": 1787843000000,
+  "text": "Duplicate Title {alertname=Duplicate Title, environment=production, instance=x, severity=critical}"},
+ {"id": 7, "alertId": 1, "alertName": "API | 5XX", "newState": "Pending", "prevState": "Normal", "time": 1787836830000, "timeEnd": 1787836830000, "text": "API | 5XX {alertname=API | 5XX, api=/v1/orders, environment=production}"}
+]

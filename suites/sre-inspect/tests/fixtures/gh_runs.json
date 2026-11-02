@@ -1,0 +1,5 @@
+{"total_count": 3, "workflow_runs": [
+ {"id": 1, "name": "Production Deploy", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "6904298a053a9b59ffb530e9847ba5b290e18575", "display_title": "Production Deploy", "conclusion": "success", "updated_at": "2026-08-27T03:14:43Z", "html_url": "https://github.com/example-org/example-service/actions/runs/1"},
+ {"id": 2, "name": "Multidev Update", "event": "push", "head_branch": "feat/x", "head_sha": "1111111111111111111111111111111111111111", "display_title": "feat: x", "conclusion": "success", "updated_at": "2026-08-27T03:20:00Z", "html_url": "https://github.com/example-org/example-service/actions/runs/2"},
+ {"id": 3, "name": "Production Deploy", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "2222222222222222222222222222222222222222", "display_title": "Production Deploy (old)", "conclusion": "success", "updated_at": "2026-08-20T03:14:43Z", "html_url": "https://github.com/example-org/example-service/actions/runs/3"}
+]}

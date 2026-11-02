@@ -1,0 +1,187 @@
+rules:
+  - id: php-string-built-sql
+    languages: [php]
+    severity: WARNING
+    message: String-built SQL reaches a database call. Check the input and parameter binding.
+    metadata:
+      category: sqli
+    mode: taint
+    pattern-sources:
+      - exact: true
+        pattern-either:
+          - patterns:
+              - pattern: $LEFT . $RIGHT
+              - metavariable-regex:
+                  metavariable: $LEFT
+                  regex: '.*\$'
+          - patterns:
+              - pattern: $LEFT . $RIGHT
+              - metavariable-regex:
+                  metavariable: $RIGHT
+                  regex: '.*\$'
+      - exact: true
+        by-side-effect: true
+        patterns:
+          - pattern: $SQL .= $PART
+          - metavariable-regex:
+              metavariable: $PART
+              regex: '.*\$'
+          - focus-metavariable: $SQL
+      - exact: true
+        pattern-regex: '"[^"\n]*\$[^"\n]*"'
+      - exact: true
+        pattern: sprintf($FORMAT, $ARG, ...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB->query($SQL, ...)
+              - pattern: $DB->execute($SQL, ...)
+              - pattern: $DB->exec($SQL, ...)
+              - pattern: $DB->prepare($SQL, ...)
+              - pattern: $DB->fetchOne($SQL, ...)
+              - pattern: $DB->fetchAll($SQL, ...)
+              - pattern: mysqli_query($DB, $SQL, ...)
+              - pattern: mysqli_multi_query($DB, $SQL)
+              - pattern: mysqli_real_query($DB, $SQL)
+              - pattern: mysqli_execute_query($DB, $SQL, ...)
+          - focus-metavariable: $SQL
+
+  - id: php-nonliteral-command
+    languages: [php]
+    severity: WARNING
+    message: A nonliteral command reaches a shell. Check the input and escaping.
+    metadata:
+      category: cmd-injection
+    pattern-either:
+      - patterns:
+          - pattern: $FUNCTION($COMMAND, ...)
+          - metavariable-regex:
+              metavariable: $FUNCTION
+              regex: '^(exec|system|shell_exec|passthru|popen|proc_open)$'
+          - metavariable-regex:
+              metavariable: $COMMAND
+              regex: '^(?!\x27[^\x27]*\x27$|"[^"$]*"$)'
+      - pattern-regex: '`[^`\n]*\$[^`\n]*`'
+
+  - id: php-unsafe-unserialize
+    languages: [php]
+    severity: WARNING
+    message: unserialize can create objects. Use allowed_classes set to false for untrusted input.
+    metadata:
+      category: deserialization
+    patterns:
+      - pattern: unserialize($DATA, ...)
+      - pattern-not: unserialize($DATA, [..., 'allowed_classes' => false, ...])
+      - pattern-not: unserialize($DATA, array(..., 'allowed_classes' => false, ...))
+
+  - id: php-tls-verify-off
+    languages: [php]
+    severity: WARNING
+    message: TLS verification is disabled. Enable certificate and hostname verification.
+    metadata:
+      category: tls-verify-off
+    pattern-either:
+      - pattern: curl_setopt($HANDLE, CURLOPT_SSL_VERIFYPEER, false)
+      - pattern: curl_setopt($HANDLE, CURLOPT_SSL_VERIFYPEER, 0)
+      - pattern: curl_setopt($HANDLE, CURLOPT_SSL_VERIFYHOST, false)
+      - pattern: curl_setopt($HANDLE, CURLOPT_SSL_VERIFYHOST, 0)
+      - pattern: "[..., CURLOPT_SSL_VERIFYPEER => false, ...]"
+      - pattern: "[..., CURLOPT_SSL_VERIFYPEER => 0, ...]"
+      - pattern: "[..., CURLOPT_SSL_VERIFYHOST => false, ...]"
+      - pattern: "[..., CURLOPT_SSL_VERIFYHOST => 0, ...]"
+      - pattern: "[..., 'verify' => false, ...]"
+
+  - id: php-phalcon-mass-assignment
+    languages: [php]
+    severity: WARNING
+    message: Request data reaches a Phalcon model write with no field whitelist. Pass the allowed fields.
+    metadata:
+      category: mass-assignment
+    mode: taint
+    # A function result is not request input. Database rows and counts would flood the report.
+    options:
+      taint_assume_safe_functions: true
+    pattern-sources:
+      - pattern-either:
+          - pattern: $this->request->getPost()
+          - pattern: $this->request->getQuery()
+          - pattern: $this->request->getPut()
+          - pattern: $this->request->get()
+          - pattern: $this->request->getJsonRawBody(...)
+          - pattern: $_POST
+          - pattern: $_GET
+          - pattern: $_REQUEST
+    # A single request field, or an array the code builds itself, is not mass assignment.
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $_POST[$KEY]
+          - pattern: $_GET[$KEY]
+          - pattern: $_REQUEST[$KEY]
+          - pattern: "[...]"
+          - pattern: array(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $MODEL->assign($DATA)
+              - pattern: $MODEL->assign($DATA, $MAP)
+              - pattern: $MODEL->assign($DATA, $MAP, null)
+              # ponytail: Phalcon 4 assign($data, null, $columnMap) has no whitelist but is not matched.
+              # In Phalcon 3 the same shape is the fixed form, so matching it would fail every rescan. §1.16 asks triage to check the version.
+              - pattern: $MODEL->save($DATA)
+              - pattern: $MODEL->save($DATA, null)
+              - pattern: $MODEL->create($DATA)
+              - pattern: $MODEL->create($DATA, null)
+              - pattern: $MODEL->update($DATA)
+              - pattern: $MODEL->update($DATA, null)
+          - focus-metavariable: $DATA
+
+  - id: php-loose-compare-input
+    languages: [php]
+    severity: WARNING
+    message: Request input meets a loose comparison with a number, bool or null. Before PHP 8, a non-numeric string equals 0. Use === or strict mode.
+    metadata:
+      category: loose-compare
+    mode: taint
+    # A function result is not request input. Database rows and counts would flood the report.
+    options:
+      taint_assume_safe_functions: true
+    pattern-sources:
+      # An int or float filter gives a number, so the comparison is numeric on both sides.
+      - patterns:
+          - pattern-either:
+              - pattern: $this->request->$GET(...)
+              - pattern: $_GET
+              - pattern: $_POST
+              - pattern: $_REQUEST
+              - pattern: $_COOKIE
+          - pattern-not: $this->request->$GET($KEY, "int", ...)
+          - pattern-not: $this->request->$GET($KEY, "absint", ...)
+          - pattern-not: $this->request->$GET($KEY, "float", ...)
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: (int) $X
+          - pattern: (float) $X
+          - pattern: (bool) $X
+    # Only a number, bool or null on the other side is narrow enough to report.
+    # Two strings compare as strings unless both are numeric. signature-compare and numeric-juggling own that case.
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $INPUT == $LITERAL
+              - pattern: $LITERAL == $INPUT
+              - pattern: $INPUT != $LITERAL
+              - pattern: $LITERAL != $INPUT
+          - metavariable-regex:
+              metavariable: $LITERAL
+              regex: '^(-?\d[\w.]*|(?i:true|false|null))$'
+          - focus-metavariable: $INPUT
+      - patterns:
+          - pattern-either:
+              - pattern: in_array($INPUT, $HAYSTACK)
+              - pattern: in_array($INPUT, $HAYSTACK, false)
+              - pattern: array_search($INPUT, $HAYSTACK)
+              - pattern: array_search($INPUT, $HAYSTACK, false)
+          - metavariable-regex:
+              metavariable: $HAYSTACK
+              regex: '^(\[|array\s*\().*([\[(,]|=>)\s*-?\d'
+          - focus-metavariable: $INPUT

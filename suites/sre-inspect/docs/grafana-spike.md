@@ -1,0 +1,21 @@
+# grafana-spike — G0 findings (product-level; 2026-08-28)
+
+The #146 G0 checklist was run read-only against a real department Grafana with a Viewer
+service-account token. Tenant-specific inventory (datasource names/uids, rule uids, the policy
+tree) lives only in that instance's `runs/sre-inspect/spike-*.md` (gitignored); this file keeps
+what is true for any department. Re-run yours with `suites/sre-inspect/run spike`.
+
+| # | Item | Finding |
+|---|---|---|
+| 1 | `/api/health`, `/api/frontend/settings` | Grafana 12.1.1 "Enterprise (Free & unlicensed)", `rbacEnabled: true`. The SA appears as `service-account:<id>` via `/api/user`; `/api/access-control/user/permissions` lists `datasources:query` per uid (`datasources:*` when granted broadly) — `run doctor` checks each tenant datasource against it. |
+| 2 | `/api/datasources` | SLS datasources are **one per logstore** (`jsonData.project` + `jsonData.logstore`), not one per project as the ticket assumed; the SLS-workspace Prometheus endpoints (cloud monitor, application, RW) appear as ordinary `prometheus` datasources, plus per-ALB Prometheus datasources. `tenant.yaml` therefore lists logs datasources as `{name, project, logstore}`. |
+| 3 | `POST /api/ds/query` (SLS) | Works with the SA token. `logStore` and `logstore` keys both take effect (Go case-insensitive unmarshal); the datasource default applies when absent. `* \| select count(*)` on 30 min: ≈0.1–0.7 s. Raw pull `totalLogs=200`: 0.15 s / 489 KB, 200 rows, 34 columns + `message`; `totalLogs=20` → 20 rows. Group-by returns a table frame, all values `string`. `xcol=t, ycol=c` returns a time series frame (`time`, number). Bad search key → HTTP 400, `results.A.error` = SLS JSON `{"httpCode":400,"errorCode":"ParameterInvalid","errorMessage":"key (x) is not config as key value config …"}`; bad SQL column → `Column 'x' cannot be resolved; please add the column in the index attribute`; unknown datasource uid → HTTP 404 `Data source not found`. Relative `from/to` (`now-30m`) accepted. Several `refId`s in one request are answered independently. **Search-segment colon keys must not be double-quoted through the plugin** (`"__tag__:__hostname__": "h"` → 0 rows; `__tag__:__hostname__: "h"` → rows). |
+| 4 | `getLogstoreList` | `POST /api/datasources/uid/<uid>/resources/api/getLogstoreList` with JSON `{"Project": "<project>"}` → `{"data": [...names]}`. Empty body → `InvalidHost`; GET → 500. |
+| 5 | mcp-grafana 1.2.0 | Digest `sha256:cfae68f8…dc53`; uid 1000; no wget/curl; entrypoint carries `--transport sse` (override); categories singular; `/healthz` 200; streamable-http `/mcp` and stdio both complete the MCP handshake; 19 tools with `datasource,prometheus,alerting,dashboard,navigation,search`. `list_datasources` (by type), `query_prometheus` (instant needs `endTime`; range with `stepSeconds`), `list_prometheus_metric_names` (`regex`), `list_prometheus_label_values` (`matches`), `alerting_manage_rules` (`operation: list\|get\|versions`, `rule_uid`; `get` returns the full rule with data queries and state), `get_dashboard_panel_queries`, `generate_deeplink` all work against SLS-workspace Prometheus. Unauthenticated non-loopback listener logs an ERROR → set `MCP_GRAFANA_SERVER_TOKEN`. |
+| 6 | timeouts | Datasource `jsonData.timeout` unset on the instance probed; `--grafana-timeout 60s` chosen for the sidecar. The 30-day `count(*)` with/without `powerSql` is gated behind `run spike --slow` (it scans a month of logs). |
+| + | alert intake | `/api/alertmanager/grafana/api/v2/alerts` (firing, with `__alert_rule_uid__`, `fingerprint`, `startsAt`, `generatorURL`, rendered `summary`); `/api/annotations?type=alert` (transitions, title only); `/api/v1/rules/history?ruleUID` (frame with `time` in **microseconds**, `prev`/`next`, labels in `text`); `/api/prometheus/grafana/api/v1/alerts` (all instances with state); `/api/v1/provisioning/policies` (notification tree). |
+
+Consequences already applied in this suite: datasource-per-logstore model in `tenant.yaml`; colon-key
+rule in `skills/grafana-sls`; `endTime`/`operation` argument names in the Holmes `llm_instructions`;
+`MCP_GRAFANA_SERVER_TOKEN` in the env file and compose; no in-container healthcheck; `run doctor`
+checks `datasources:query` per uid.

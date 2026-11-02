@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Check that every golden sample pack under platform-internals/golden/ still closes its loop (#44).
+
+Zero-dependency (stdlib only), a sibling of check-asset-metadata / check-context-freshness. Seven
+checks, grouped by what they protect:
+
+  structure    1. PACK.md's id/entry match its directory, and every artifact its stage table names exists
+  join         2. the latest acceptance round covers exactly the requirement's current AC set  (I2)
+               3. every task in the breakdown points back at an AC that exists
+  convergence  4. the requirement's version has a changelog row                                 (I1)
+               5. each AC's evidence file is at a req_version not older than that AC             (I3)
+  alignment    6. every "#26 item" the requirement claims is listed in the spec's mapping table
+  failures     7. each planted failure PACK.md declares has a report with a root cause and a green run
+
+What it does NOT do: run anything (that is `replay` / `ws golden`), judge prose quality, or validate
+#48 asset metadata — a pack carries none by design (platform-internals/golden/README.md).
+
+Parsing is deliberately small: `---` frontmatter as `key: value` scalars, and GFM pipe tables. It is
+not a YAML or Markdown parser; it handles exactly the shapes `platform-internals/golden-sample-pack.md`
+prescribes, and an unparseable file is reported rather than skipped.
+
+usage: check-golden-pack [<pack-dir>]      no argument = every pack under platform-internals/golden/
+"""
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+SPEC = root / "platform-internals" / "golden-sample-pack.md"
+
+errors = []
+
+
+# --- tiny parsers ----------------------------------------------------------------------------
+
+def frontmatter(path):
+    """Return the `---` block as {key: value}. Scalars only; missing/blank block -> {}."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        errors.append(f"{rel(path)}: cannot read ({exc})")
+        return {}
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def tables(text):
+    """Every GFM pipe table as (header_cells, data_rows).
+
+    Fenced code blocks are skipped: the spec document shows a requirement *skeleton* inside ```
+    fences, and those illustrative tables are not the document's own data.
+    """
+    found, header, rows, fenced = [], [], [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if line.lstrip().startswith("|") and line.rstrip().endswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
+                header, rows = (rows[-1] if rows else []), []   # the line above was the header
+                continue
+            rows.append(cells)
+        elif rows:
+            found.append((header, rows))
+            header, rows = [], []
+    if rows:
+        found.append((header, rows))
+    return found
+
+
+def code_spans(cell):
+    """Backtick-quoted spans inside a table cell, in order."""
+    return re.findall(r"`([^`]+)`", cell)
+
+
+def version_of(text):
+    """First vN in a cell -> int. '**v2** (was v1: cap 80)' -> 2."""
+    m = re.search(r"\bv(\d+)\b", text or "")
+    return int(m.group(1)) if m else None
+
+
+def rel(path):
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def section(text, heading):
+    """Text of a '## <heading>' section, up to the next '## '. Empty string when absent."""
+    m = re.search(rf"^##\s+{re.escape(heading)}\s*$(.*?)(?=^##\s|\Z)", text, re.M | re.S)
+    return m.group(1) if m else ""
+
+
+# --- the checks ------------------------------------------------------------------------------
+
+def check_pack(pack):
+    """Run all seven checks against one pack directory. Appends to the module-level errors list."""
+    name = pack.name
+    pack_md = pack / "PACK.md"
+    if not pack_md.is_file():
+        errors.append(f"{rel(pack)}: no PACK.md")
+        return 0
+    pack_text = pack_md.read_text(encoding="utf-8")
+    fm = frontmatter(pack_md)
+
+    # 1. structure — identity and declared artifacts
+    if fm.get("id") != name:
+        errors.append(f"{rel(pack_md)}: id '{fm.get('id')}' does not match directory '{name}'")
+    want_entry = f"platform-internals/golden/{name}/"
+    if fm.get("entry") != want_entry:
+        errors.append(f"{rel(pack_md)}: entry '{fm.get('entry')}' should be '{want_entry}'")
+
+    stage_artifacts = []
+    for _, table in tables(pack_text):
+        for row in table:
+            if not row or not re.match(r"^\d+[a-z]?$", row[0]):
+                continue                                    # stage rows start with 1, 1b, 2, ...
+            for cell in row[1:]:
+                for span in code_spans(cell):
+                    if "/" in span and not span.startswith(("platform-internals/", "repos/", "scripts/")):
+                        stage_artifacts.append(span)
+    for artifact in stage_artifacts:
+        if not (pack / artifact).exists():
+            errors.append(f"{rel(pack_md)}: stage table names a missing artifact: {artifact}")
+
+    # locate the requirement (the one file that is not the changelog)
+    reqs = [p for p in sorted((pack / "requirement").glob("REQ-*.md")) if "changelog" not in p.name]
+    if len(reqs) != 1:
+        errors.append(
+            f"{rel(pack)}/requirement: expected exactly one requirement file, found {len(reqs)}"
+        )
+        return 0
+    req = reqs[0]
+    req_text = req.read_text(encoding="utf-8")
+    req_fm = frontmatter(req)
+
+    # the AC table: rows whose first cell is AC-<n>
+    ac_rows = {}
+    for _, table in tables(req_text):
+        for row in table:
+            m = re.match(r"^\*{0,2}(AC-\d+)\*{0,2}$", row[0])
+            if m and len(row) >= 5:
+                ac_rows[m.group(1)] = row
+    if not ac_rows:
+        errors.append(f"{rel(req)}: no acceptance-criteria table (rows keyed AC-<n>)")
+        return 0
+
+    # 4. convergence I1 — every requirement version in play has a changelog row
+    changelog = pack / "requirement" / f"{req.stem.split('-campaign')[0]}-changelog.md"
+    if not changelog.is_file():
+        candidates = list((pack / "requirement").glob("*changelog*.md"))
+        changelog = candidates[0] if candidates else None
+    if changelog is None:
+        errors.append(f"{rel(pack)}/requirement: no changelog file")
+    else:
+        logged = set()
+        for _, table in tables(changelog.read_text(encoding="utf-8")):
+            for row in table:
+                v = version_of(row[0])
+                if v is not None:
+                    logged.add(v)
+        in_play = {version_of(req_fm.get("version", ""))} | {version_of(r[1]) for r in ac_rows.values()}
+        for v in sorted(x for x in in_play if x is not None):
+            if v not in logged:
+                errors.append(
+                    f"{rel(changelog)}: requirement version v{v} is in use but has no changelog row (I1)"
+                )
+
+    # 5. convergence I3 — evidence is never older than the criterion it supports
+    for ac, row in sorted(ac_rows.items()):
+        ac_version = version_of(row[1])
+        spans = [s for cell in row[4:] for s in code_spans(cell) if s.endswith(".md")]
+        if not spans:
+            errors.append(f"{rel(req)}: {ac} has no evidence pointer")
+            continue
+        ev = (req.parent / spans[0]).resolve()
+        if not ev.is_file():
+            errors.append(f"{rel(req)}: {ac} evidence file not found: {spans[0]}")
+            continue
+        ev_version = version_of(frontmatter(ev).get("req_version", ""))
+        if ac_version is None or ev_version is None:
+            errors.append(f"{rel(req)}: {ac} — cannot compare versions (criterion/evidence missing vN)")
+        elif ev_version < ac_version:
+            errors.append(
+                f"{rel(req)}: {ac} is at v{ac_version} but its evidence {spans[0]} is at "
+                f"v{ev_version} — evidence predates the criterion (I3)"
+            )
+
+    # 2. join I2 — the latest acceptance round covers exactly the current AC set
+    acceptance = pack / "acceptance" / "ACCEPTANCE.md"
+    accepted = set()
+    if not acceptance.is_file():
+        errors.append(f"{rel(pack)}/acceptance/ACCEPTANCE.md: missing")
+    else:
+        acc_text = acceptance.read_text(encoding="utf-8")
+        current = frontmatter(acceptance).get("current_round")
+        if not current:
+            errors.append(f"{rel(acceptance)}: frontmatter has no current_round")
+        else:
+            m = re.search(rf"^##\s+Round\s+{re.escape(current)}\b.*?$(.*?)(?=^##\s|\Z)",
+                          acc_text, re.M | re.S)
+            if not m:
+                errors.append(f"{rel(acceptance)}: no '## Round {current}' section")
+            else:
+                for _, table in tables(m.group(1)):
+                    for row in table:
+                        am = re.match(r"^\*{0,2}(AC-\d+)\*{0,2}$", row[0])
+                        if am:
+                            accepted.add(am.group(1))
+                missing = set(ac_rows) - accepted
+                orphan = accepted - set(ac_rows)
+                if missing:
+                    errors.append(
+                        f"{rel(acceptance)}: Round {current} does not cover "
+                        f"{', '.join(sorted(missing))} (I2)"
+                    )
+                if orphan:
+                    errors.append(
+                        f"{rel(acceptance)}: Round {current} accepts "
+                        f"{', '.join(sorted(orphan))}, which the requirement no longer lists (I2)"
+                    )
+
+    # 3. join — every task points back at an AC that exists
+    tasks = pack / "breakdown" / "TASKS.md"
+    if not tasks.is_file():
+        errors.append(f"{rel(pack)}/breakdown/TASKS.md: missing")
+    else:
+        seen_task = False
+        for _, table in tables(tasks.read_text(encoding="utf-8")):
+            for row in table:
+                if not re.match(r"^\*{0,2}T-\d+\*{0,2}$", row[0]) or len(row) < 2:
+                    continue
+                seen_task = True
+                refs = re.findall(r"AC-\d+", row[1])
+                if not refs:
+                    errors.append(f"{rel(tasks)}: task {row[0]} names no AC")
+                for r in refs:
+                    if r not in ac_rows:
+                        errors.append(f"{rel(tasks)}: task {row[0]} points at {r}, which does not exist")
+        if not seen_task:
+            errors.append(f"{rel(tasks)}: no task rows (keyed T-<n>)")
+
+    # 6. alignment — every #26 item the requirement claims is in the spec's mapping table
+    spec_source = req_fm.get("spec_source", "")
+    if "platform-internals/golden-sample-pack.md" not in spec_source:
+        errors.append(
+            f"{rel(req)}: spec_source must point at platform-internals/golden-sample-pack.md "
+            f"(got: {spec_source or '(absent)'})"
+        )
+    if SPEC.is_file():
+        mapped = set()
+        for header, table in tables(SPEC.read_text(encoding="utf-8")):
+            # the mapping table is the one with a "#26 item" column; find it by name so a column
+            # added to its left does not silently move what we read
+            col = next((i for i, h in enumerate(header) if "#26 item" in h), None)
+            if col is None:
+                continue
+            for row in table:
+                if len(row) > col:
+                    mapped.update(int(n) for n in re.findall(r"\d+", row[col]))
+        claimed = set()
+        for m in re.finditer(r"\(#26 items?\s+([\d\s+,and]+)\)", req_text):
+            claimed.update(int(n) for n in re.findall(r"\d+", m.group(1)))
+        for item in sorted(claimed - mapped):
+            errors.append(
+                f"{rel(req)}: claims #26 item {item}, which the mapping table in "
+                f"platform-internals/golden-sample-pack.md does not list"
+            )
+    else:
+        errors.append("platform-internals/golden-sample-pack.md: missing (the mapping table lives there)")
+
+    # 7. failures — every declared planted failure has a real report
+    pf_count = 0
+    for _, table in tables(pack_text):
+        for row in table:
+            if not re.match(r"^\*{0,2}PF-\d+\*{0,2}$", row[0]):
+                continue
+            pf_count += 1
+            spans = [s for cell in row[1:] for s in code_spans(cell) if s.endswith(".md")]
+            if not spans:
+                errors.append(f"{rel(pack_md)}: {row[0]} declares no report file")
+                continue
+            report = pack / spans[0]
+            if not report.is_file():
+                errors.append(f"{rel(pack_md)}: {row[0]} report not found: {spans[0]}")
+                continue
+            rtext = report.read_text(encoding="utf-8")
+            for heading in ("Root cause", "Green"):
+                if not section(rtext, heading).strip():
+                    errors.append(f"{rel(report)}: {row[0]} report has no substantive '## {heading}'")
+    if pf_count == 0:
+        errors.append(f"{rel(pack_md)}: declares no planted failure (every pack must carry one)")
+
+    return len(accepted)
+
+
+# --- run -------------------------------------------------------------------------------------
+
+if len(sys.argv) > 1:
+    packs = [pathlib.Path(sys.argv[1]).resolve()]
+else:
+    golden = root / "platform-internals" / "golden"
+    packs = sorted(p for p in golden.iterdir() if p.is_dir()) if golden.is_dir() else []
+
+if not packs:
+    print("OK: no golden sample pack present (nothing to check)")
+    sys.exit(0)
+
+rows = sum(check_pack(p) for p in packs)
+
+if errors:
+    print("FAIL: golden sample pack")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+print(f"OK: {len(packs)} golden pack(s), {rows} acceptance rows resolve to requirement items")

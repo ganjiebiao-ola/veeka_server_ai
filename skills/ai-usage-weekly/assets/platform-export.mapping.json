@@ -1,0 +1,45 @@
+{
+  "version": "1",
+  "_about": "Column-name aliases for `--platform-export` (CSV / XLSX from the unified API platform). Matching is case- and space-insensitive. A column that is neither mapped here nor listed under `ignore` makes the tool exit 2 naming it — it never guesses. Add aliases here when your platform's export differs.",
+  "columns": {
+    "day": ["date", "day", "日期", "usage date"],
+    "user": ["user", "user id", "userid", "member", "account", "用户", "成员"],
+    "model": ["model", "model id", "模型"],
+    "requests": ["requests", "request count", "request_count", "calls", "请求数", "请求"],
+    "input": ["input tokens", "input_tokens", "input", "prompt tokens", "prompt_tokens", "输入 token"],
+    "output": ["output tokens", "output_tokens", "output", "completion tokens", "completion_tokens", "输出 token"],
+    "cache_read": ["cached tokens", "cached_tokens", "cache read tokens", "cache_read_input_tokens", "cache_read", "缓存读取"],
+    "cache_creation": ["cache creation tokens", "cache_creation_input_tokens", "cache write tokens", "cache_creation", "缓存写入"],
+    "cost": ["cost (usd)", "cost", "amount", "费用", "金额"],
+    "currency": ["currency", "币种"]
+  },
+  "ignore": ["notes", "备注", "project", "workspace", "api key", "api key name", "key"],
+  "date_formats": ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"],
+  "currencies": ["USD", "CNY", "SGD", "EUR", "GBP", "JPY", "HKD", "TWD", "KRW", "INR"],
+  "bill_columns": ["source", "nature", "currency", "amount", "since", "until", "confirmed"],
+  "_about_allocation": "Column-name aliases for `month --allocation` (the monthly LiteLLM key allocation xlsx). `allocation_sheets` names the two sheets read. Same rules as `columns`: a column that is neither mapped nor listed under `allocation_ignore` makes the tool exit 2 naming it.",
+  "allocation_sheets": {"spend": "Real Spend", "summary": "Summary"},
+  "allocation_columns": {
+    "vk": ["vk (email)", "vk", "virtual key"],
+    "team": ["team", "团队"],
+    "provider": ["provider", "供应商"],
+    "model": ["model", "模型"],
+    "tokens": ["total tokens", "tokens"],
+    "token_share": ["token share (%)", "token share"],
+    "currency": ["original currency"],
+    "original_cost": ["original cost"],
+    "cost_usd": ["cost (usd)"]
+  },
+  "allocation_summary_columns": {
+    "provider": ["provider", "供应商"],
+    "model": ["model", "模型"],
+    "currency": ["original currency"],
+    "total_original": ["total cost (original)"],
+    "total_usd": ["total cost (usd)"],
+    "allocated_usd": ["allocated (usd)"],
+    "unallocated_usd": ["unallocated (usd)"],
+    "vk_count": ["vk count"]
+  },
+  "allocation_ignore": [],
+  "allocation_unallocated_keys": ["[Unallocated]"]
+}

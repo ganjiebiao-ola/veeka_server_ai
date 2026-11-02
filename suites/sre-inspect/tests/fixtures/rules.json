@@ -1,0 +1,10 @@
+[
+ {"uid": "changeme00000001", "title": "API | 5XX", "folderUID": "f1", "ruleGroup": "API", "data": [{"datasourceUid": "dssls000000001"}]},
+ {"uid": "changeme00000002", "title": "DTS | Sync Delay", "folderUID": "f1", "ruleGroup": "DTS", "data": []},
+ {"uid": "changeme00000003", "title": "ECS | CPU", "folderUID": "f1", "ruleGroup": "ECS", "data": []},
+ {"uid": "nsq0000000000001", "title": "NSQ | Congested Channel", "folderUID": "f1", "ruleGroup": "NSQ", "data": []},
+ {"uid": "changeme00000009", "title": "Process | Restarted", "folderUID": "f1", "ruleGroup": "Process", "data": []},
+ {"uid": "dup0000000000001", "title": "Duplicate Title", "folderUID": "f1", "ruleGroup": "X", "data": []},
+ {"uid": "dup0000000000002", "title": "Duplicate Title", "folderUID": "f2", "ruleGroup": "X", "data": []},
+ {"uid": "mile000000000001", "title": "Milestone Event", "folderUID": "f1", "ruleGroup": "M", "data": []}
+]

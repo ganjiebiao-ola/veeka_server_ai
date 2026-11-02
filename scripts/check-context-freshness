@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Check the Context Manifest (team-context/manifest.yaml) for freshness, authority consistency, and bloat.
+
+Zero-dependency (stdlib only), a sibling of check-asset-metadata. Delivered by #49; consumed by
+#50's `health` as the "context freshness" check. It is the machine layer of the three red lines:
+  - no lag:           each entry's last_reviewed is within REVIEW_WINDOW_DAYS, and expires (if set) >= today
+  - no bloat:         each team-context/mounted-repos/*.md is <= MAX_REPO_CONTEXT_LINES lines
+  - no inconsistency: a given path never carries conflicting `authority` values (single authoritative version)
+
+It is a conformance guard, not the health runner (that is #50). The parser is deliberately tiny: it
+handles the `{ key: val, ... }` inline-map rows this manifest uses, not general YAML. Rows whose path
+contains a <placeholder> are template rows: their dates are checked, path-existence is skipped. Same
+for rows marked `optional: true` — a path that legitimately may not exist yet (a gitignored sidecar
+such as workspace.local.yaml, created by scripts/setup-repos, not by the clone).
+Argv[1] optionally names an alternate manifest file (same override convention as
+check-asset-metadata) — `ws health --self-test` points it at a planted stale fragment. When an
+alternate manifest is given, the no-bloat guard scans *its* sibling mounted-repos/ directory rather
+than the workspace root's — that one guard is never mixed across manifests. Path-existence and
+authority/date checks are unaffected by this scoping: a manifest's `path:` entries name real
+workspace paths (relative to the workspace root) regardless of where the manifest file itself lives.
+"""
+import datetime
+import re
+import sys
+import pathlib
+
+REVIEW_WINDOW_DAYS = 365
+MAX_REPO_CONTEXT_LINES = 150
+
+root = pathlib.Path(__file__).resolve().parent.parent
+manifest_path = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "team-context" / "manifest.yaml"
+try:
+    manifest = manifest_path.read_text()
+except FileNotFoundError:
+    print("FAIL: context-manifest governance")
+    print(f"  - missing {manifest_path}: the Context Manifest (#49) is required;")
+    print("    restore team-context/manifest.yaml from the template.")
+    sys.exit(1)
+today = datetime.date.today()
+
+# --- parse inline-map read entries, tracking their task_type ---
+entries = []          # list of (task_type, {key: val})
+current_tt = None
+in_task_types = False
+for raw in manifest.splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    if re.match(r"^task_types:\s*$", raw):
+        in_task_types = True
+        continue
+    if not in_task_types:
+        continue
+    m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)   # task_type header: exactly two-space indent, no value
+    if m:
+        current_tt = m.group(1)
+        continue
+    m = re.match(r"^\s*-\s*\{(.+)\}\s*$", raw)        # an inline-map read entry
+    if m and current_tt:
+        d = {}
+        for pair in m.group(1).split(","):
+            if ":" in pair:
+                k, v = pair.split(":", 1)
+                d[k.strip()] = v.strip()
+        entries.append((current_tt, d))
+
+if not entries:
+    sys.exit(f"ERROR: no read entries parsed from {manifest_path}")
+
+errors = []
+authority_by_path = {}
+for tt, d in entries:
+    path = d.get("path", "")
+    authority = d.get("authority", "")
+    lr = d.get("last_reviewed", "")
+    where = f"[{tt}] {path or '?'}"
+
+    if authority not in ("trusted", "data"):
+        errors.append(f"{where}: authority '{authority}' not in trusted|data")
+
+    if path:                                          # no-inconsistency: one authority per path
+        prev = authority_by_path.get(path)
+        if prev is not None and prev != authority:
+            errors.append(f"{where}: conflicting authority for '{path}' ({prev} vs {authority})")
+        authority_by_path[path] = authority
+
+    try:                                              # no-lag: last_reviewed window
+        reviewed = datetime.date.fromisoformat(lr)
+        if (today - reviewed).days > REVIEW_WINDOW_DAYS:
+            errors.append(f"{where}: STALE — last_reviewed {lr} is over {REVIEW_WINDOW_DAYS} days old")
+    except ValueError:
+        errors.append(f"{where}: last_reviewed '{lr}' is not a valid YYYY-MM-DD date")
+
+    exp = d.get("expires")                            # no-lag: optional hard expiry
+    if exp:
+        try:
+            if datetime.date.fromisoformat(exp) < today:
+                errors.append(f"{where}: STALE — expires {exp} is in the past")
+        except ValueError:
+            errors.append(f"{where}: expires '{exp}' is not a valid YYYY-MM-DD date")
+
+    # `optional: true` marks a row whose path may legitimately be absent (a gitignored sidecar that a
+    # later setup step writes). Its dates and authority are still checked — only existence is skipped,
+    # so an optional row can never become a place to park a stale entry.
+    optional = d.get("optional", "").lower() in ("true", "yes")
+    if path and "<" not in path and not optional:     # path existence (skip template/optional rows)
+        if not (root / path).exists():
+            errors.append(f"{where}: path does not exist")
+
+# --- no-bloat guard: <manifest dir>/mounted-repos/*.md <= MAX_REPO_CONTEXT_LINES ---
+# Scoped to the manifest under test, not to the workspace root: with an alternate manifest (argv[1])
+# the root's own mounted-repos/ is not what that manifest governs.
+repos_dir = manifest_path.parent / "mounted-repos"
+if repos_dir.is_dir():
+    for f in sorted(repos_dir.glob("*.md")):
+        n = len(f.read_text().splitlines())
+        if n > MAX_REPO_CONTEXT_LINES:
+            try:                                      # report workspace-relative when it is inside the root
+                shown = f.relative_to(root)
+            except ValueError:
+                shown = f
+            errors.append(f"{shown}: {n} lines exceeds {MAX_REPO_CONTEXT_LINES}-line no-bloat guard")
+
+if errors:
+    print("FAIL: context-manifest governance")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+
+print(f"OK: {len(entries)} manifest entries fresh, authorities consistent, no bloat")

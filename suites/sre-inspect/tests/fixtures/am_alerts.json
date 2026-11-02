@@ -1,0 +1,15 @@
+[
+ {"labels": {"__alert_rule_uid__": "changeme00000001", "alertname": "API | 5XX", "api": "/v1/orders", "environment": "production", "severity": "critical", "status": "500"},
+  "annotations": {"summary": "API /v1/orders returned `500` 3 times in the last minute", "__dashboardUid__": "d1"},
+  "startsAt": "2026-08-27T13:21:30.123456789Z", "endsAt": "2026-08-27T13:25:30Z", "fingerprint": "a1b2c3d4e5f60718",
+  "generatorURL": "https://grafana.example.internal/alerting/grafana/changeme00000001/view", "status": {"state": "active"}},
+ {"labels": {"__alert_rule_uid__": "changeme00000009", "alertname": "Process | Restarted", "processGroup": "svc.worker", "environment": "production", "severity": "info"},
+  "annotations": {}, "startsAt": "2026-08-27T12:00:00Z", "endsAt": "0001-01-01T00:00:00Z", "fingerprint": "ffffffff00000001",
+  "generatorURL": "", "status": {"state": "active"}},
+ {"labels": {"__alert_rule_uid__": "changeme00000003", "alertname": "ECS | CPU", "instance": "app-host-004", "environment": "staging", "severity": "warning"},
+  "annotations": {}, "startsAt": "2026-08-27T13:00:00Z", "endsAt": "2026-08-27T13:04:00Z", "fingerprint": "eeeeeeee00000001",
+  "generatorURL": "", "status": {"state": "active"}},
+ {"labels": {"__alert_rule_uid__": "changeme00000001", "alertname": "API | 5XX", "api": "/v1/suppressed", "environment": "production", "severity": "critical"},
+  "annotations": {}, "startsAt": "2026-08-27T13:21:30Z", "endsAt": "2026-08-27T13:25:30Z", "fingerprint": "s1s2s3s4s5s6s7s8",
+  "generatorURL": "", "status": {"state": "suppressed"}}
+]

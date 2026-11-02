@@ -1,0 +1,5 @@
+# Planted fixture — a context-manifest fragment with an expired entry.
+task_types:
+  demo:
+    read:
+      - { path: knowledge/old.md, authority: data, last_reviewed: 2020-01-01, expires: 2021-01-01 }

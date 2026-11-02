@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+# suites/security-patch/run — operator verbs for the codesec tool (#43 convention). Contract: SUITE.md.
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ "$1" = doctor ]; then
+  if [ -f "$here/app/.env" ]; then
+    set -a
+    . "$here/app/.env"
+    set +a
+  fi
+  tracker_repo="${OLA_AGENT_TRACKER_REPO:-olaola-chat/security-patch-tracker}"
+  tracker_token="$(python3 -c 'import os; print(os.getenv("GH_TOKEN", "").strip() or os.getenv("OLA_AGENT_GH_TOKEN", "").strip())')"
+  push_access="$(GH_TOKEN="$tracker_token" gh api "repos/$tracker_repo" --jq .permissions.push 2>/dev/null)"
+  if [ "$push_access" = true ]; then
+    printf '[OK] tracker repository push access\n'
+  else
+    printf '[MISS] push access to OLA_AGENT_TRACKER_REPO (%s); a fine-grained token must include that repo\n' "$tracker_repo"
+  fi
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import secpatch; sys.exit(secpatch.main(sys.argv[2:]))' "$here/lib" "$@"
+  status=$?
+  [ "$push_access" = true ] || exit 1
+  exit "$status"
+fi
+exec python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import secpatch; sys.exit(secpatch.main(sys.argv[2:]))' "$here/lib" "$@"

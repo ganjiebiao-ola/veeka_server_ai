@@ -1,0 +1,55 @@
+# Optional local HolmesGPT + the mcp-grafana sidecar, on the department Grafana data plane.
+# Claude Code / Codex do NOT need this file (they use `run mcp-config` + tools/grafana-sls directly).
+#
+# Before `docker compose -f suites/sre-inspect/holmes/docker-compose.yaml up -d`:
+#   1. cp holmes/config.yaml.example holmes/.holmes/config.yaml   (edit model/api_base)
+#   2. env/.env.holmes filled (see env/holmes-env.example), chmod 600
+#   3. HOLMES_IMAGE set to your locally built HolmesGPT fork image (built from source; no registry)
+# Usage from the suite: `run dive <n> --holmes` runs `python /app/holmes_cli.py ask` in a one-off
+# container. Long dives: start detached (nohup/setsid); a foreground timeout kills the dive midway.
+services:
+  holmes:
+    image: ${HOLMES_IMAGE:-holmes-ocinf:main}
+    env_file:
+      - ../env/.env.holmes
+    # NOTE: `${VAR}` here would be interpolated from the *host* shell, not from env_file — so the LLM
+    # key is carried by env_file as OPENAI_API_KEY directly (see env/holmes-env.example).
+    environment:
+      - TOOL_SCHEMA_NO_PARAM_OBJECT_IF_NO_PARAMS=true
+      - HOLMES_LAZY_BUILTIN_TOOLSETS=true
+      - INTERNET_TOOLSET_TIMEOUT_SECONDS=10
+      - HOLMES_TOOL_RESULT_STORAGE_PATH=/tool-results
+      - ENABLE_ADMIN_API=true
+    volumes:
+      - ./.holmes:/root/.holmes
+      - ../tools/grafana-sls:/tools/grafana-sls:ro
+      - ../toolsets:/toolsets:ro
+      - ../../../skills/grafana-sls:/skills/grafana-sls:ro    # single source: the workspace's bundled skill
+      - ./tool-results:/tool-results
+    entrypoint: ["python", "-u", "server.py"]
+    ports:
+      - "127.0.0.1:${HOLMES_PORT:-5051}:5050"                 # loopback only; 5051 so a reference instance on 5050 can coexist
+    depends_on:
+      - grafana-mcp
+    restart: unless-stopped
+    mem_limit: 1536m
+    memswap_limit: 1536m
+
+  grafana-mcp:
+    # pinned by digest (docker pull 2026-08-28); the image runs as uid 1000 and ships no wget/curl,
+    # so there is no in-container healthcheck — `run doctor` probes it from outside.
+    image: grafana/mcp-grafana:1.2.0@sha256:cfae68f893dbe40cb6df69579f78beb226f973ded4436d47c844f91d2f00dc53
+    container_name: sre-inspect-grafana-mcp
+    restart: unless-stopped
+    mem_limit: 192m
+    memswap_limit: 192m
+    env_file:
+      - ../env/.env.holmes           # GRAFANA_URL / GRAFANA_SERVICE_ACCOUNT_TOKEN / GRAFANA_ORG_ID / MCP_GRAFANA_SERVER_TOKEN
+    # the image entrypoint hard-codes `--transport sse --address 0.0.0.0:8000`; override it
+    entrypoint: ["/app/mcp-grafana"]
+    command: ["-t", "streamable-http", "--address", ":8000", "--endpoint-path", "/mcp",
+              "--disable-write",
+              "--enabled-tools", "datasource,prometheus,alerting,dashboard,navigation,search",
+              "--grafana-timeout", "60s",
+              "--allowed-hosts", "grafana-mcp:8000,sre-inspect-grafana-mcp:8000"]
+    # caller auth: the binary reads MCP_GRAFANA_SERVER_TOKEN from env (never on argv)

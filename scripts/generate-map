@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""Generate knowledge/maps/<id>/README.md for a mounted repo, via codebase-memory-mcp.
+
+Zero-dependency (stdlib only), a sibling of scripts/setup-repos/setup-skills. Indexes the repo's
+code into a local knowledge graph (`codebase-memory-mcp cli index_repository`, no `--persistence`
+so nothing is written inside the mounted repo itself — repos/ stays untouched) and renders its
+architecture summary (`get_architecture`) into knowledge/maps/<id>/README.md, this workspace's
+"code map" home for a mounted repo (see knowledge/maps/README.md and team-context/manifest.yaml's
+`knowledge/maps/<id>/` placeholder rows).
+
+This is a **structural** map, not a narrative one — it doesn't replace
+`team-context/mounted-repos/<id>.md` (cross-repo relations, sharp edges, owner TODOs), it
+complements it with what the graph tool can answer cheaply: languages, packages, entry points,
+index coverage. Requires the codebase-memory-mcp binary — run `scripts/setup-map-tool` first if
+it's missing.
+"""
+import contextlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+root = pathlib.Path(__file__).resolve().parent.parent
+ws_file = root / "workspace.yaml"
+local_file = root / "workspace.local.yaml"
+maps_dir = root / "knowledge" / "maps"
+
+_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+# A .cbmignore keeps generated/vendored/sensitive trees out of the graph. It only goes stale when
+# the repo's layout moves, so re-reviewing it is a rare, deliberate act (skills/code-map-scope) —
+# this threshold only decides when to *nag*, never when to block.
+CBMIGNORE_STALE_DAYS = 90
+HISTORY_LIMIT = 20
+
+# Headless executors, in preference order — same detection contract as
+# suites/sre-autofix/lib/headless.py (the operator's own agent CLI, no separate credential).
+AGENT_CLIS = ("claude", "codex")
+AUTO_WALL_SEC = 900
+
+# Aspects that make up architecture.md (#211: "service entry points, core packages, structural
+# layers"). Deliberately narrow: `layers`/`clusters`/`overview` all report by bare package name,
+# not by real file path, so they can't be trusted to label an actual top-level directory (a
+# package called "model" may sit at app/model/, lib/model/, or both) — dumping them produced a
+# graph-stats printout, not a map. entry_points/hotspots/routes carry real qn/file paths and
+# drive the "Start here" tree below; boundaries stays as a coarse who-calls-whom hint only.
+ARCH_ASPECTS = ["entry_points", "hotspots", "boundaries", "routes"]
+
+
+def usage(exit_code):
+    print(__doc__.strip().splitlines()[0])
+    print()
+    print("usage: scripts/generate-map <repo-id> | --all [--force] [--mode fast|moderate|full]")
+    print("       scripts/generate-map --stamp-cbmignore <repo-id>")
+    print("  <repo-id>            generate the map for one repo registered in workspace.local.yaml")
+    print("  --all                generate the map for every mounted repo whose map is missing or")
+    print("                       older than the repo's HEAD (up-to-date maps are skipped)")
+    print("  --force              with --all, regenerate every map, including up-to-date ones")
+    print("  --mode               index_repository mode (default: full)")
+    print("  --stamp-cbmignore    record who reviewed the code map's .cbmignore and when,")
+    print("                       without regenerating the map (used by skills/code-map-scope)")
+    print("  --no-auto-cbmignore  don't have the agent CLI write a missing .cbmignore; index")
+    print("                       everything git doesn't ignore instead (default: auto)")
+    print("  --index-only         build the local graph only (for the MCP tools); write nothing")
+    print("                       under knowledge/ (used by scripts/setup-repos after a clone)")
+    sys.exit(exit_code)
+
+
+def _git_out(*args, default=""):
+    try:
+        out = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return default
+    return out or default
+
+
+def run_log(command, exit_code):
+    runs_dir = root / "runs"
+    runs_dir.mkdir(exist_ok=True)
+    sha = _git_out("rev-parse", "HEAD", default="0" * 40)
+    short_sha = _git_out("rev-parse", "--short", "HEAD", default="nogit")
+    operator = _git_out("config", "user.name") or os.environ.get("USER", "unknown")
+    now = datetime.now(timezone.utc)
+    line = json.dumps({
+        "run_id": f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{short_sha}",
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "workspace_sha": sha,
+        "command": f"generate-map {command}",
+        "exit_code": exit_code,
+        "operator": operator,
+    }, ensure_ascii=False) + "\n"
+    with open(runs_dir / "run-log.jsonl", "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def code_map_dir(repo_id):
+    # One workspace = one project (agent-instructions/mount-points.md, "Instance boundary"), so a
+    # code map needs no project segment — the workspace it sits in already says which project.
+    return maps_dir / repo_id
+
+
+def rel_map(repo_id, name):
+    return str((code_map_dir(repo_id) / name).relative_to(root))
+
+
+def repo_head(checkout):
+    # _git_out is pinned to the framework repo; the mounted repo needs its own -C.
+    try:
+        out = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return "unknown"
+    return out or "unknown"
+
+
+def operator_identity():
+    """Who is accountable for this run, and whether it came through an agent session.
+
+    The human-id is always the recorded actor — this workspace introduces no agent identity
+    (rules/team-rules.md). `via` only says which channel the human used, so a map refreshed by an
+    agent on someone's behalf is still attributable to that someone.
+    """
+    operator = _git_out("config", "user.name") or os.environ.get("USER", "unknown")
+    agent = os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE") or os.environ.get("CODEX_SANDBOX")
+    return operator, ("agent-session" if agent else "direct")
+
+
+def provenance_path(repo_id):
+    return code_map_dir(repo_id) / "provenance.json"
+
+
+def read_provenance(repo_id):
+    path = provenance_path(repo_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _toml_str(path, key):
+    # Top-level `key = "value"` only; enough for ~/.codex/config.toml without a toml dependency.
+    try:
+        m = re.search(rf'^{key}\s*=\s*"([^"]+)"', path.read_text(), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def agent_runtime(agent):
+    """Best-effort {model, effort} the agent ran with, so provenance can say which model wrote what.
+
+    Unknown values are recorded as "unknown" rather than guessed. For the calling Claude Code
+    session the model isn't in the env, so it's read from the session transcript's last turn.
+    """
+    home = pathlib.Path.home()
+    if agent == "codex":
+        cfg = home / ".codex" / "config.toml"
+        return {"model": _toml_str(cfg, "model") or "unknown",
+                "effort": _toml_str(cfg, "model_reasoning_effort") or "unknown"}
+    try:
+        settings = json.loads((home / ".claude" / "settings.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        settings = {}
+    model = os.environ.get("ANTHROPIC_MODEL") or settings.get("model") or ""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not model and sid:
+        for transcript in (home / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
+            with transcript.open("rb") as f:
+                f.seek(max(0, transcript.stat().st_size - 200_000))
+                found = re.findall(rb'"model":"([^"]+)"', f.read())
+            if found:
+                model = found[-1].decode()
+    effort = os.environ.get("CLAUDE_EFFORT") or settings.get("effortLevel") or "unknown"
+    return {"model": model or "unknown", "effort": effort}
+
+
+def detect_agent():
+    for name in AGENT_CLIS:
+        if shutil.which(name):
+            return name
+    return ""
+
+
+def cbmignore_prompt(repo_id, repo_path):
+    """The headless brief. Points at the skill rather than restating it, so the procedure has one
+    authoritative version (skills/code-map-scope/SKILL.md) whether a person or a CLI runs it."""
+    return (
+        f"Write the code-map exclusion list for the mounted repo '{repo_id}'.\n\n"
+        f"Follow skills/code-map-scope/SKILL.md in this workspace — read it first and do exactly what "
+        f"its Procedure section says (survey the layout, classify into the four buckets, confirm "
+        f"every path exists before writing it).\n\n"
+        f"Repo to review: {repo_path}\n"
+        f"File to write:  {rel_map(repo_id, '.cbmignore')}\n\n"
+        f"Hard rules: write that one file and nothing else; never write into {repo_path}; never "
+        f"exclude hand-written production code; every path you list must be one you confirmed "
+        f"exists. Do not run the stamp or generate commands — the caller does that. "
+        f"Finish by printing the bucket counts you wrote."
+    )
+
+
+def build_agent_argv(agent, prompt, effort="unknown"):
+    if agent == "claude":
+        # JSON output reports the model actually used; --effort pins what provenance records.
+        pin = ["--effort", effort] if effort != "unknown" else []
+        return ["claude", "-p", prompt, "--output-format", "json", *pin, "--permission-mode", "acceptEdits",
+                "--allowedTools", "Read", "Write", "Edit", "Grep", "Glob",
+                "Bash(ls:*)", "Bash(find:*)", "Bash(du:*)", "Bash(wc:*)", "Bash(head:*)",
+                "--disallowedTools", "WebFetch", "WebSearch"]
+    return ["codex", "exec", "--cd", str(root), "--sandbox", "workspace-write",
+            "--skip-git-repo-check", prompt]
+
+
+def run_agent_task(repo_id, prompt, expect_name, what):
+    """Run the operator's own agent CLI headlessly until `expect_name` lands in the code map dir.
+
+    Same trust model as suites/sre-autofix's headless fix: the agent runs as the operator, with the
+    operator's credentials, and the human-id stays accountable for what it produced — callers record
+    `via: agent-auto` so a reader knows nobody reviewed it in the moment.
+
+    Returns (produced path, {model, effort}), or (None, None). Never raises: an unattended generator that cannot produce
+    its artifact degrades to "not generated", it does not fail the map.
+    """
+    agent = detect_agent()
+    if not agent:
+        print(f"  NOTE: no agent CLI on PATH (claude/codex) — cannot write {what}.", file=sys.stderr)
+        return None, None
+
+    print(f"  writing {what} for {repo_id} via `{agent}` (headless, up to {AUTO_WALL_SEC}s) ...")
+    try:
+        runtime = agent_runtime(agent)
+        proc = subprocess.run(build_agent_argv(agent, prompt, runtime["effort"]), cwd=str(root), timeout=AUTO_WALL_SEC,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        print(f"  NOTE: {agent} timed out after {AUTO_WALL_SEC}s — no {what} written", file=sys.stderr)
+        return None, None
+    except OSError as exc:
+        print(f"  NOTE: could not run {agent}: {exc}", file=sys.stderr)
+        return None, None
+
+    produced = code_map_dir(repo_id) / expect_name
+    if not produced.exists():
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        print(f"  NOTE: {agent} exited {proc.returncode} without writing "
+              f"{rel_map(repo_id, expect_name)}", file=sys.stderr)
+        for ln in tail:
+            print(f"        {ln}", file=sys.stderr)
+        return None, None
+    if agent == "claude":
+        try:
+            usage = json.loads(proc.stdout).get("modelUsage") or {}
+        except (json.JSONDecodeError, AttributeError):
+            usage = {}
+        if usage:  # the model that did the most output is the one that wrote the file
+            runtime["model"] = max(usage, key=lambda m: usage[m].get("outputTokens", 0))
+    return produced, runtime
+
+
+def auto_review_cbmignore(repo_id, repo_path):
+    produced, runtime = run_agent_task(repo_id, cbmignore_prompt(repo_id, repo_path),
+                              ".cbmignore", "the .cbmignore")
+    if produced is None:
+        print("        Run the code-map-scope skill yourself, or pass --no-auto-cbmignore.",
+              file=sys.stderr)
+        return False
+
+    rules = [ln for ln in produced.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    if not rules:
+        print("  NOTE: the agent wrote a .cbmignore with no actual rules — ignoring it", file=sys.stderr)
+        return False
+
+    write_provenance(repo_id, "cbmignore-reviewed",
+                     {"lines": len(rules), "agent": detect_agent(), **runtime}, via_override="agent-auto")
+    print(f"  OK: wrote {rel_map(repo_id, '.cbmignore')} ({len(rules)} rules)")
+    return True
+
+
+def write_provenance(repo_id, action, extra, via_override=None):
+    """Append one history entry and refresh the per-action `last` record.
+
+    Answers "when was this map (or its .cbmignore) last refreshed, by whom, through what" without
+    needing git history — the artifacts themselves are regenerated wholesale, so a diff cannot tell
+    you who asked for it or which tool version produced it.
+    """
+    operator, via = operator_identity()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {"at": now, "action": action, "operator": operator, "via": via_override or via}
+    if entry["via"] == "agent-session":
+        entry.update(agent_runtime("codex" if os.environ.get("CODEX_SANDBOX") else "claude"))
+    entry.update(extra)
+
+    data = read_provenance(repo_id)
+    data["repo_id"] = repo_id
+    last = data.get("last") if isinstance(data.get("last"), dict) else {}
+    last[action] = entry
+    data["last"] = last
+    history = data.get("history") if isinstance(data.get("history"), list) else []
+    history.append(entry)
+    data["history"] = history[-HISTORY_LIMIT:]
+
+    path = provenance_path(repo_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return entry
+
+
+def cbmignore_status(repo_id):
+    """(path_or_None, human-readable status) for this repo's tracked .cbmignore."""
+    src = code_map_dir(repo_id) / ".cbmignore"
+    if not src.exists():
+        return None, "missing"
+    stamped = (read_provenance(repo_id).get("last") or {}).get("cbmignore-reviewed")
+    if not stamped:
+        return src, "present (never stamped — run the skills/code-map-scope review to record who owns it)"
+    try:
+        reviewed = datetime.strptime(stamped["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (KeyError, ValueError):
+        return src, "present (unparseable review timestamp)"
+    age = datetime.now(timezone.utc) - reviewed
+    if age > timedelta(days=CBMIGNORE_STALE_DAYS):
+        return src, f"stale ({age.days}d since review by {stamped.get('operator', '?')})"
+    return src, f"reviewed {age.days}d ago by {stamped.get('operator', '?')}"
+
+
+def find_binary():
+    found = shutil.which("codebase-memory-mcp")
+    if found:
+        return found
+    env_dir = os.environ.get("CBM_INSTALL_DIR")
+    fallback = pathlib.Path(env_dir) if env_dir else (pathlib.Path.home() / ".local" / "bin")
+    candidate = fallback / "codebase-memory-mcp"
+    return str(candidate) if candidate.exists() else None
+
+
+def read_local_repo_paths():
+    # Same {id -> path} shape as scripts/setup-repos' read_local_repos; duplicated rather than
+    # imported since these are standalone scripts, not a shared module (same convention as
+    # setup-repos/setup-skills each carrying their own small parser).
+    if not local_file.exists():
+        return {}
+    repos, cur, in_block = {}, None, False
+    for raw in local_file.read_text().splitlines():
+        if re.match(r"^repositories:\s*$", raw):
+            in_block = True
+            continue
+        if in_block and re.match(r"^[A-Za-z_]", raw):
+            break
+        if not in_block:
+            continue
+        m_id = re.match(r"^\s*-\s*id:\s*(.+)$", raw)
+        if m_id:
+            cand = m_id.group(1).split("#", 1)[0].strip().strip("\"'")
+            if _ID_RE.match(cand or ""):
+                cur = cand
+                repos[cur] = f"repos/{cur}"
+            continue
+        m_path = re.match(r"^\s+path:\s*(.+)$", raw)
+        if m_path and cur:
+            val = m_path.group(1).split("#", 1)[0].strip().strip("\"'")
+            if val:
+                repos[cur] = val
+    return repos
+
+
+def cli(binary, tool, args_obj):
+    """Run one codebase-memory-mcp tool and return its payload, unwrapped from the MCP envelope.
+
+    `cli --json <tool>` answers in MCP shape: {"content":[{"type":"text","text":...}],
+    "structuredContent": {...}, "isError": bool}. Tools differ in which half carries the answer —
+    index_repository fills structuredContent with a dict, get_architecture only returns a
+    pre-formatted text block — so this returns a dict when there is one and the text otherwise,
+    and callers render accordingly.
+    """
+    proc = subprocess.run(
+        [binary, "cli", "--json", tool], input=json.dumps(args_obj), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise RuntimeError(detail[-1] if detail else f"{tool} exited {proc.returncode}")
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{tool} did not return valid JSON: {exc}") from exc
+
+    if not isinstance(envelope, dict):
+        return envelope
+    if envelope.get("isError"):
+        raise RuntimeError(f"{tool} reported an error: {json.dumps(envelope)[:300]}")
+    if isinstance(envelope.get("structuredContent"), dict):
+        return envelope["structuredContent"]
+    for part in envelope.get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text", "")
+            try:                      # some tools put JSON *inside* the text part
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+    return envelope
+
+
+def render_value(value):
+    if isinstance(value, (dict, list)):
+        return "```json\n" + json.dumps(value, indent=2, ensure_ascii=False) + "\n```"
+    return "```\n" + str(value).rstrip() + "\n```"
+
+
+def render_coverage(index_result):
+    """Coverage bullets from index_repository's structuredContent.
+
+    Coverage is the honest half of a generated map: what the graph does NOT hold is what a reader
+    must go grep by hand (the same rule skills/code-map-query states). Unknown keys are ignored
+    rather than guessed at, so a tool-version change degrades to fewer bullets, not wrong ones.
+    """
+    if not isinstance(index_result, dict):
+        return "coverage not reported in a structured form by this tool version:\n\n" + render_value(index_result)
+
+    labels = [
+        ("status", "index status"),
+        ("nodes", "nodes"),
+        ("edges", "edges"),
+        ("skipped_count", "files skipped (not indexed at all)"),
+        ("parse_partial_count", "files partially parsed (constructs may be missing)"),
+        ("not_indexed_files_count", "files excluded by design (gitignore/.cbmignore/skip-list)"),
+    ]
+    lines = [f"- **{label}**: {index_result[key]}" for key, label in labels if key in index_result]
+    excluded = index_result.get("excluded")
+    if isinstance(excluded, dict) and excluded.get("dirs"):
+        lines.append(f"- **excluded dirs** (first {len(excluded['dirs'])}): `{'`, `'.join(excluded['dirs'])}`")
+    if not lines:
+        return "coverage detail not reported by this tool version:\n\n" + render_value(index_result)
+    lines.append("")
+    lines.append("A clean count is not proof of completeness — for a negative or exhaustive claim, "
+                 "re-check with `check_index_coverage` and grep the reported ranges.")
+    return "\n".join(lines)
+
+
+def parse_arch_sections(text):
+    """Split get_architecture's pre-formatted text into {aspect: [row, ...]}.
+
+    Each aspect starts a line like 'entry_points: 10  (cols: qn file)'; every following
+    2-space-indented line up to the next blank line is one whitespace-separated row of that
+    aspect. The tool always answers in this text shape (never structured JSON) as of 0.11.0.
+    """
+    sections, current = {}, None
+    for line in text.splitlines():
+        if re.match(r"^\w+: \d+\s+\(cols: .*\)$", line):
+            current = line.split(":", 1)[0]
+            sections[current] = []
+        elif not line.strip():
+            current = None
+        elif current is not None and line.startswith("  "):
+            sections[current].append(line.strip())
+    return sections
+
+
+def top_level_dirs(checkout, ignore_src):
+    """Real (ground-truth) top-level directories, minus what the .cbmignore already excludes.
+
+    Deliberately not derived from any graph aspect: `layers` reports bare package names with no
+    path, which can't be told apart from a same-named package nested elsewhere. A directory
+    listing is always right about what a directory is called.
+    """
+    excluded = {".git"}
+    if ignore_src is not None:
+        for raw in pathlib.Path(ignore_src).read_text().splitlines():
+            cleaned = raw.split("#", 1)[0].strip().strip("/")
+            # Only a pattern naming a *whole* top-level directory excludes one here — a nested
+            # rule (/app/gola/model/, /public/fonts/) must not blank out its entire parent, and a
+            # glob (**/*.pb.go) never names a real top-level directory at all.
+            if cleaned and "/" not in cleaned and not any(c in cleaned for c in "*?["):
+                excluded.add(cleaned)
+    try:
+        return sorted(d.name for d in checkout.iterdir()
+                      if d.is_dir() and not d.name.startswith(".") and d.name not in excluded)
+    except OSError:
+        return []
+
+
+def build_start_here(repo_id, checkout, ignore_src, sections):
+    """A `tree`-depth-1 map of the repo, annotated only from graph facts that carry a real path
+    (entry_points, hotspots) — never from bare-package-name aspects (layers/boundaries/clusters),
+    which can silently mislabel a directory. The point is fewer hops to the right file, so this
+    stays short: unannotated directories are still listed, just without a claim about them.
+    """
+    prefix = repo_id + "."
+    entries_by_dir, root_entries = {}, []
+    for row in sections.get("entry_points", []):
+        parts = row.split()
+        if len(parts) < 2:
+            continue
+        file = parts[-1]
+        if "/" in file:
+            entries_by_dir.setdefault(file.split("/", 1)[0], []).append(file)
+        else:
+            root_entries.append(file)
+
+    dirs = top_level_dirs(checkout, ignore_src)
+    hotspots_by_dir = {}
+    for row in sections.get("hotspots", []):
+        parts = row.split()
+        if len(parts) < 2:
+            continue
+        qn, fan_in = parts[0], parts[-1]
+        rel = qn[len(prefix):] if qn.startswith(prefix) else qn
+        top = rel.split(".", 1)[0]
+        if top in dirs:
+            hotspots_by_dir.setdefault(top, []).append((rel, fan_in))
+
+    lines = [f"{repo_id}/"]
+    for f in sorted(root_entries):
+        lines.append(f"├── {f:<24} entry point")
+    for d in dirs:
+        notes = []
+        if d in entries_by_dir:
+            files = ", ".join(sorted(entries_by_dir[d]))
+            notes.append(f"entry ({files})")
+        if d in hotspots_by_dir:
+            top2 = sorted(hotspots_by_dir[d], key=lambda x: -int(x[1]))[:2]
+            notes.append("high fan-in: " + ", ".join(f"{n} ({c})" for n, c in top2))
+        note = f"{d + '/':<24} " + "; ".join(notes) if notes else f"{d}/"
+        lines.append(f"├── {note}".rstrip())
+    return lines
+
+
+def hide_from_git(checkout, name):
+    """Add `name` to the repo's local .git/info/exclude (never committed), once."""
+    # --git-path resolves worktrees/submodules, where .git is a file rather than a directory.
+    rel = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--git-path", "info/exclude"],
+                         capture_output=True, text=True).stdout.strip()
+    exclude = checkout / rel
+    text = exclude.read_text() if exclude.exists() else ""
+    if f"/{name}" not in text.splitlines():
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with open(exclude, "a") as f:
+            f.write(("" if not text or text.endswith("\n") else "\n") + f"/{name}\n")
+
+
+STUCK_DAEMON = ("pre-coordination", "unverified", "coordination could not")
+_recovered = []  # session graph-server pids stopped by recover_daemon, so --all recovers only once
+
+
+def recover_daemon(binary):
+    """Stop a stuck codebase-memory-mcp daemon so the next CLI call starts a fresh one.
+
+    `daemon stop` refuses while sessions are connected, so stop their graph-server processes first
+    (the sessions themselves keep running, without graph tools until they are resumed), then any
+    daemon left over. Seen on 0.11.0: a stuck daemon blocked the CLI and in-session indexing alike.
+    """
+    status = subprocess.run([binary, "daemon", "status"], capture_output=True, text=True, timeout=15).stdout
+    clients = re.findall(r"^\s+- pid (\d+)\s*$", status, re.M)
+    daemons = subprocess.run(["pgrep", "-f", f"{binary} --cbm-daemon-internal"],
+                             capture_output=True, text=True).stdout.split()
+    for pid in clients:
+        with contextlib.suppress(OSError):
+            os.kill(int(pid), signal.SIGTERM)
+    time.sleep(2)
+    subprocess.run([binary, "daemon", "stop"], capture_output=True, text=True, timeout=30)
+    for pid in daemons:
+        with contextlib.suppress(OSError):
+            os.kill(int(pid), signal.SIGTERM)
+    time.sleep(1)
+    _recovered.append(len(clients))
+    return clients
+
+
+def generate_one(binary, repo_id, repo_path, mode, auto_cbmignore=True, index_only=False):
+    checkout = root / repo_path
+    if not (checkout / ".git").exists():
+        print(f"  SKIP: {repo_id} — {repo_path} is not a git checkout (run scripts/setup-repos first)", file=sys.stderr)
+        return False
+
+    ignore_src, ignore_status = cbmignore_status(repo_id)
+    if ignore_src is None and auto_cbmignore:
+        # Missing is the case worth automating: it happens once per repo, and without it the graph
+        # is dominated by generated code. A *stale* list still works, so that one only nags —
+        # re-reviewing on a schedule would spend tokens on repos whose layout never moved.
+        if auto_review_cbmignore(repo_id, repo_path):
+            ignore_src, ignore_status = cbmignore_status(repo_id)
+    if ignore_src is None:
+        print(f"  NOTE: no {rel_map(repo_id, '.cbmignore')} — indexing everything git doesn't ignore.")
+        print(f"        Run the skills/code-map-scope review to exclude generated/vendored/sensitive trees.")
+    else:
+        print(f"  .cbmignore: {ignore_status}")
+        if ignore_status.startswith("stale"):
+            print(f"        Re-run the skills/code-map-scope review (or delete the file and re-run "
+                  f"to have the agent rewrite it) — the repo layout may have moved since.")
+
+    print(f"indexing {repo_id} ({repo_path}, mode={mode}) ...")
+    # The tool reads .cbmignore from the repo root. knowledge/ holds the tracked copy; the copy
+    # staged into the repo is left in place (hidden via .git/info/exclude, so the business repo
+    # never shows a change) because the MCP server's background reindex reads it too — removing
+    # it would let generated/vendored trees back into the graph on the next file change. Only a
+    # repo that tracks its own .cbmignore gets it restored afterwards, so a tracked file never drifts.
+    staged_dest = checkout / ".cbmignore"
+    original = staged_dest.read_bytes() if staged_dest.exists() else None
+    repo_tracks_it = subprocess.run(
+        ["git", "-C", str(checkout), "ls-files", "--error-unmatch", ".cbmignore"],
+        capture_output=True).returncode == 0
+    retry = False
+    try:
+        if ignore_src is not None:
+            shutil.copyfile(ignore_src, staged_dest)
+            if not repo_tracks_it:
+                hide_from_git(checkout, ".cbmignore")
+        index_result = cli(binary, "index_repository", {
+            "repo_path": str(checkout.resolve()), "name": repo_id, "mode": mode,
+        })
+        if index_only:
+            print(f"  OK: indexed {repo_id} (graph only, knowledge/ untouched)")
+            return True
+        arch = cli(binary, "get_architecture", {"project": repo_id, "aspects": ARCH_ASPECTS})
+    except RuntimeError as exc:
+        print(f"  FAIL: {repo_id} — {exc}", file=sys.stderr)
+        # A healthy daemon lets this run beside open agent sessions (checked on 0.11.0), so this
+        # error means a stuck daemon. A separate CBM_RUNTIME_DIR no longer helps on 0.11.
+        if any(s in str(exc) for s in STUCK_DAEMON) and not _recovered:
+            stopped = recover_daemon(binary)
+            print(f"        Stopped a stuck codebase-memory-mcp daemon and {len(stopped)} session graph "
+                  "server(s). Retrying ...", file=sys.stderr)
+            retry = True
+        else:
+            if "generation is active" in str(exc):
+                print("        Another index is running. Retry when it finishes.", file=sys.stderr)
+            return False
+    finally:
+        if ignore_src is not None and repo_tracks_it:
+            if original is None:
+                staged_dest.unlink(missing_ok=True)
+            else:
+                staged_dest.write_bytes(original)
+    if retry:
+        return generate_one(binary, repo_id, repo_path, mode, auto_cbmignore, index_only)
+
+    out_dir = code_map_dir(repo_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
+    src_line = f"generated by scripts/generate-map via {version or 'codebase-memory-mcp'} (mode: {mode})"
+
+    def frontmatter(kind):
+        return ["---", f'title: "{repo_id} — {kind}"', "category: maps", "status: generated",
+                f"last_reviewed: {today}", f"source: {src_line}", "---", ""]
+
+    # architecture.md carries the graph's structural answer; README.md is the index over the dir.
+    # Splitting them is what keeps one fact in one place — the contract in knowledge/maps/README.md.
+    sections = parse_arch_sections(arch) if isinstance(arch, str) else {}
+    arch_body = frontmatter("architecture map") + [
+        f"# {repo_id} — architecture map",
+        "",
+        f"> Generated from the code map's knowledge graph — re-run `ws map generate {repo_id}` to "
+        f"refresh, don't hand-edit. Structure only: it shows what calls what, never whether that "
+        f"boundary was intended. For intent, ownership and cross-repo contracts read "
+        f"`team-context/mounted-repos/{repo_id}.md` and the project map above this directory.",
+        "",
+        "## Start here",
+        "",
+        "```",
+        *build_start_here(repo_id, checkout, ignore_src, sections),
+        "```",
+        "",
+        "Directories are real (a plain listing, minus what `.cbmignore` excludes); the annotations "
+        "are not — only two are trustworthy at path level: `entry` (this directory contains a "
+        "file with a `main`) and `high fan-in` (this directory's most-called symbols, from "
+        "`hotspots`). An unannotated directory has no graph signal, not zero importance.",
+        "",
+    ]
+    if sections.get("hotspots"):
+        arch_body += [
+            "## Hotspots (called from everywhere — check before changing)", "",
+            "```", *sections["hotspots"], "```", "",
+        ]
+    if sections.get("routes"):
+        arch_body += ["## HTTP routes", "", "```", *sections["routes"][:15], "```", ""]
+    # The graph misses routes that a loop registers from a table. A route inventory at
+    # knowledge/api/ENDPOINTS.md, when present, is built from the router code itself, so point there.
+    endpoints = root / "knowledge" / "api" / "ENDPOINTS.md"
+    if endpoints.exists() and re.search(rf"^## {re.escape(repo_id)}\b", endpoints.read_text(), re.M):
+        arch_body += [
+            "**Every endpoint** (method, path, handler) is in `knowledge/api/ENDPOINTS.md` under "
+            f"`## {repo_id}`. The routes above are only what the graph found; routes registered "
+            "by a loop over a route map are not `Route` nodes.", "",
+        ]
+    if sections.get("boundaries"):
+        arch_body += [
+            "## Boundaries (who calls whom)", "",
+            "Package-level names, not paths — a name here may not match a top-level directory "
+            "above (see the note under Start here).", "",
+            "```", *sections["boundaries"], "```", "",
+        ]
+    (out_dir / "architecture.md").write_text("\n".join(arch_body).rstrip("\n") + "\n")
+
+    body = frontmatter("code map") + [
+        f"# {repo_id} — code map",
+        "",
+        f"> Generated — re-run `ws map generate {repo_id}` to refresh, don't hand-edit. This "
+        f"directory is the **code map** for one repo: structure only. For cross-repo relations, "
+        f"sharp edges and ownership, read `team-context/mounted-repos/{repo_id}.md` first.",
+        "",
+        "## In this code map",
+        "",
+        "| File | What it holds |",
+        "|---|---|",
+        "| [`architecture.md`](architecture.md) | A top-level directory map, entry points, hotspots, HTTP routes and boundaries — from the graph. |",
+        "| `.cbmignore` | What the graph excludes, and why. |",
+        "| `provenance.json` | When each artifact was refreshed, by whom, through which channel. |",
+        "",
+        "## Index coverage",
+        "",
+        render_coverage(index_result),
+        "",
+    ]
+
+    (out_dir / "README.md").write_text("\n".join(body).rstrip("\n") + "\n")
+
+    write_provenance(repo_id, "architecture-generated",
+                     {"tool": version or "codebase-memory-mcp", "aspects": ",".join(ARCH_ASPECTS)})
+    stamp = write_provenance(repo_id, "map-generated", {
+        "tool": version or "codebase-memory-mcp",
+        "mode": mode,
+        "repo_head": repo_head(checkout),
+        "cbmignore": ignore_status,
+    })
+    print(f"  OK: wrote {rel_map(repo_id, 'README.md')} + architecture.md (provenance.json, "
+          f"{stamp['operator']} via {stamp['via']})")
+    return True
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        usage(0 if argv and argv[0] in ("-h", "--help") else 2)
+
+    if argv[0] == "--stamp-cbmignore":
+        if len(argv) != 2 or not _ID_RE.match(argv[1]):
+            print("generate-map: --stamp-cbmignore takes exactly one repo id", file=sys.stderr)
+            usage(2)
+        repo_id = argv[1]
+        src = code_map_dir(repo_id) / ".cbmignore"
+        if not src.exists():
+            print(f"FAIL: {rel_map(repo_id, '.cbmignore')} does not exist — write it first", file=sys.stderr)
+            run_log(" ".join(argv), 1)
+            return 1
+        stamp = write_provenance(repo_id, "cbmignore-reviewed", {
+            "lines": len([ln for ln in src.read_text().splitlines() if ln.strip() and not ln.startswith("#")]),
+        })
+        print(f"OK: stamped {rel_map(repo_id, '.cbmignore')} as reviewed by "
+              f"{stamp['operator']} via {stamp['via']} at {stamp['at']}")
+        run_log(" ".join(argv), 0)
+        return 0
+
+    auto_cbmignore = True
+    if "--no-auto-cbmignore" in argv:
+        auto_cbmignore = False
+        argv = [a for a in argv if a != "--no-auto-cbmignore"]
+        if not argv:
+            usage(2)
+
+    # A teammate's local index must not rewrite the committed map (provenance, README) or have an
+    # agent author a .cbmignore under knowledge/ — so --index-only never auto-writes one either.
+    index_only = "--index-only" in argv
+    if index_only:
+        auto_cbmignore = False
+        argv = [a for a in argv if a != "--index-only"]
+        if not argv:
+            usage(2)
+
+    force = "--force" in argv
+    argv = [a for a in argv if a != "--force"]
+    if not argv:
+        usage(2)
+
+    mode = "full"
+    if "--mode" in argv:
+        i = argv.index("--mode")
+        if i + 1 >= len(argv):
+            print("generate-map: --mode requires a value", file=sys.stderr)
+            usage(2)
+        mode = argv[i + 1]
+        if mode not in ("fast", "moderate", "full"):
+            print(f"generate-map: --mode must be fast|moderate|full (got {mode!r})", file=sys.stderr)
+            usage(2)
+        argv = argv[:i] + argv[i + 2:]
+        if not argv:
+            usage(2)
+
+    binary = find_binary()
+    if not binary:
+        print("FAIL: codebase-memory-mcp not found — run `scripts/setup-map-tool` first", file=sys.stderr)
+        run_log(" ".join(argv), 1)
+        return 1
+    # A map built by another build than the pin would silently undo (or pre-empt) a pin bump.
+    # The pin lives only in scripts/setup-map-tool, same source scripts/check-map reads.
+    pin = re.search(r'^PINNED_VERSION = "v?([^"]+)"', (root / "scripts" / "setup-map-tool").read_text(), re.M)
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
+    if pin and version.split()[-1:] != [pin.group(1)]:
+        print(f"FAIL: codebase-memory-mcp is {version.split()[-1] if version else 'an unknown version'}, workspace pins "
+              f"v{pin.group(1)} — run `ws map install`, then restart agent sessions", file=sys.stderr)
+        run_log(" ".join(argv), 1)
+        return 1
+
+    local_repos = read_local_repo_paths()
+
+    if argv[0] == "--all":
+        if not local_repos:
+            print("FAIL: no repos registered in workspace.local.yaml — run scripts/setup-repos first", file=sys.stderr)
+            run_log(" ".join(argv), 1)
+            return 1
+        targets = list(local_repos.items())
+        if not index_only and not force:
+            # Skip maps already built from the repo's current HEAD: rebuilding them changes nothing.
+            current = [rid for rid, path in targets
+                       if (code_map_dir(rid) / "architecture.md").exists()
+                       and ((read_provenance(rid).get("last") or {}).get("map-generated") or {}).get("repo_head")
+                       == repo_head(root / path)]
+            if current:
+                print(f"up to date (skipped, --force rebuilds): {', '.join(current)}")
+            targets = [(rid, path) for rid, path in targets if rid not in current]
+    else:
+        unknown = [rid for rid in argv if rid not in local_repos]
+        if unknown:
+            print(f"generate-map: not mounted (see workspace.local.yaml): {', '.join(unknown)}", file=sys.stderr)
+            usage(2)
+        targets = [(rid, local_repos[rid]) for rid in argv]
+
+    ok, failed = [], []
+    for repo_id, repo_path in targets:
+        if generate_one(binary, repo_id, repo_path, mode, auto_cbmignore, index_only):
+            ok.append(repo_id)
+        else:
+            failed.append(repo_id)
+
+    print()
+    print(f"{'indexed' if index_only else 'generated'}: {', '.join(ok) if ok else '(none)'}")
+    if failed:
+        print(f"failed: {', '.join(failed)}")
+
+    if _recovered:
+        print("NOTE: a stuck codebase-memory-mcp daemon was restarted. Exit and resume your open "
+              "Claude Code / Codex sessions to get their graph tools back.")
+    exit_code = 1 if failed else 0
+    run_log(" ".join(argv), exit_code)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

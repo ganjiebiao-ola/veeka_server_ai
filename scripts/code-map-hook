@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""SessionStart / SubagentStart hook: tell agents the code graphs are indexed per mounted repo.
+
+codebase-memory-mcp's own hook checks only the session's cwd — the workspace root, which is never
+indexed — and says "no indexed graph project matched this working directory" (subagents are also
+told to ask the parent to index). Agents believe it and grep instead, even though every
+repos/<id> is indexed as project <id> (scripts/generate-map). This adds the correction next to it.
+
+On SessionStart it also re-indexes each mounted repo in the background. CBM's watcher follows only
+the session's own project (the workspace root), so without this a repo's graph never refreshes
+after a pull or branch switch. An unchanged repo re-indexes in under a second.
+Never fails the session: any error prints nothing and exits 0.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+
+
+def refresh():
+    # No inherited pipes or waits: SessionStart has a five-second deadline.
+    try:
+        subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), "--refresh-worker"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def cli(binary, tool, args, *flags):
+    return subprocess.run([binary, "cli", "--json", tool, *flags], input=json.dumps(args),
+                          capture_output=True, text=True, check=True, timeout=600).stdout
+
+
+def worktrees(checkout):
+    output = subprocess.run(["git", "-C", str(checkout), "worktree", "list", "--porcelain"],
+                            capture_output=True, text=True, check=True, timeout=30).stdout
+    paths = {pathlib.Path(line[len("worktree "):]).resolve()
+             for line in output.splitlines() if line.startswith("worktree ")}
+    if checkout.resolve() not in paths:
+        raise ValueError("Incomplete worktree list")
+    return paths
+
+
+def worktree_name(repo_id, checkout, current=()):
+    checkout = checkout.resolve()
+    folder = re.sub(r"[^A-Za-z0-9._-]", "_", checkout.name)
+    folder = re.sub(r'-+', '-', folder)
+    if folder != checkout.name or sum(path.name == checkout.name for path in current) > 1:
+        suffix = hashlib.sha256(str(checkout).encode()).hexdigest()[:8]
+        folder = f"{folder.rstrip('-')}-{suffix}"
+    return f"{repo_id}.wt.{folder}"
+
+
+def hide_from_git(checkout):
+    # Mirror generate-map: --git-path also handles a worktree's .git file.
+    rel = subprocess.run(["git", "-C", str(checkout), "rev-parse", "--git-path", "info/exclude"],
+                         capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+    if not rel:
+        raise ValueError("Missing git exclude path")
+    exclude = checkout / rel
+    text = exclude.read_text() if exclude.exists() else ""
+    if "/.cbmignore" not in text.splitlines():
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a") as stream:
+            stream.write(("" if not text or text.endswith("\n") else "\n") + "/.cbmignore\n")
+
+
+def copy_nofollow(source, dest):
+    # O_NOFOLLOW closes the gap between the caller's lstat and this write if a symlink appears.
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as out:
+        out.write(pathlib.Path(source).read_bytes())
+
+
+def index_worktree(binary, repo_id, checkout, current=()):
+    source = root / "knowledge/maps" / repo_id / ".cbmignore"
+    dest = checkout / ".cbmignore"
+    try:
+        if not stat.S_ISREG(dest.lstat().st_mode):
+            return
+    except FileNotFoundError:
+        pass
+    if source.exists():
+        result = subprocess.run(["git", "-C", str(checkout), "ls-files", "--error-unmatch", ".cbmignore"],
+                                capture_output=True, timeout=30)
+        if result.returncode not in (0, 1):
+            raise ValueError("Cannot check tracked ignore file")
+        if result.returncode == 1:
+            copy_nofollow(source, dest)
+            hide_from_git(checkout)
+    cli(binary, "index_repository", {
+        "repo_path": str(checkout), "name": worktree_name(repo_id, checkout, current), "mode": "full"})
+
+
+def list_projects(binary):
+    # --format is a CLI flag after the tool name. In the JSON args it is ignored and the tree layout comes back.
+    envelope = json.loads(cli(binary, "list_projects", {"limit": 500}, "--format", "json"))
+    if envelope.get("isError"):
+        raise ValueError("Project list failed")
+    blocks = envelope["content"]
+    if len(blocks) != 1 or blocks[0].get("type") != "text":
+        raise ValueError("Unknown project list envelope")
+    data = json.loads(blocks[0]["text"])
+    projects = data["projects"] if isinstance(data, dict) else data
+    if not isinstance(projects, list) or any(
+            not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"]
+            or not isinstance(p.get("root_path"), str) or not pathlib.Path(p["root_path"]).is_absolute()
+            for p in projects):
+        raise ValueError("Unknown project list layout")
+    return projects
+
+
+def refresh_worker(mounts):
+    binary = shutil.which("codebase-memory-mcp")
+    if not binary:
+        return
+    try:
+        projects = list_projects(binary)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+        # An unreadable list must never authorize deletion.
+        projects = []
+    current_by_repo = {}
+    protected_names = set(mounts)
+    for repo_id, path in mounts.items():
+        try:
+            current = set(worktrees(path))
+            names = {worktree_name(repo_id, checkout, current) for checkout in current - {path.resolve()}}
+            protected_names.update(names)
+            current_by_repo[repo_id] = current
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    for repo_id, path in mounts.items():
+        try:
+            # Keep the main-checkout safeguard. Worktrees stage their own copy below.
+            if not (root / "knowledge/maps" / repo_id / ".cbmignore").exists() or (path / ".cbmignore").exists():
+                cli(binary, "index_repository", {"repo_path": str(path.resolve()), "name": repo_id, "mode": "full"})
+        # ValueError covers UnicodeDecodeError.
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        try:
+            main_path = path.resolve()
+            current = current_by_repo[repo_id]
+        except (OSError, ValueError, KeyError):
+            continue
+        # Failed discovery cannot authorize deletion of another repo's worktree names.
+        prefix = f"{repo_id}.wt."
+        for project in projects:
+            try:
+                name = project["name"]
+                if (len(current_by_repo) != len(mounts) or not name.startswith(prefix)
+                        or len(name) == len(prefix) or name in protected_names):
+                    continue
+                try:
+                    pathlib.Path(project["root_path"]).lstat()
+                except FileNotFoundError:
+                    cli(binary, "delete_project", {"project": name})
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue
+        for checkout in sorted(current - {main_path}):
+            try:
+                index_worktree(binary, repo_id, checkout, current)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                continue
+
+
+def version_note():
+    """A sentence for the agent when the installed CBM differs from the workspace pin, else ''."""
+    binary = shutil.which("codebase-memory-mcp")
+    try:
+        pin = re.search(r'^PINNED_VERSION = "v?([^"]+)"', (root / "scripts/setup-map-tool").read_text(), re.M)
+    except OSError:
+        return ""
+    if not binary or not pin:
+        return ""
+    try:
+        version = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=3).stdout.split()[-1:]
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if version == [pin.group(1)]:
+        return ""
+    return (f" codebase-memory-mcp is {version[0] if version else 'an unknown version'}, but the workspace pins "
+            f"v{pin.group(1)}. Tell the operator. To update, follow skills/code-map-query/SKILL.md § Updating the tool.")
+
+
+def main(argv=()):
+    from lib.mounts import registered_repos  # inside main so an import error still exits 0
+    if list(argv) == ["--refresh-worker"]:
+        refresh_worker(registered_repos(root))
+        return
+    event = json.load(sys.stdin).get("hook_event_name", "SessionStart")
+    mounts = {}
+    for repo_id, path in registered_repos(root).items():
+        try:
+            if (path / ".git").exists():
+                mounts[repo_id] = path
+        except OSError:
+            continue
+    repos = sorted(mounts)
+    if not repos:
+        return
+    note = ""
+    if event == "SessionStart":
+        refresh()
+        note = version_note()
+    msg = ("[workspace code map] Ignore any \"no indexed graph project matched this working directory\" "
+           "message: it checks only the workspace root. Graph projects belong to individual mounted repos, and the graph "
+           f"project name is the repo id: {', '.join(repos)}. For a structural question (who calls X, where "
+           "a handler lives, what a change reaches), use the known repo id in search_graph or trace_path "
+           "before broad code searches. Mounted folders do not prove an index exists. "
+           "If a query reports a missing project, use list_projects and follow "
+           "agent-instructions/code-map.md. Worktree graphs are named '<repo-id>.wt.<folder>'.")
+    if event == "SubagentStart":
+        # Subagents cannot start other subagents, so the only fallback is the parent's evidence.
+        msg += (" Use the exact tool prefix mcp__codebase-memory-mcp__ (hyphens, not underscores). "
+                "On 'No such tool', check the name. Load deferred tools with ToolSearch. Retry before using rg. "
+                "Query the graph when your role has its read-only tools. "
+                "Otherwise use the parent's graph evidence or ask the parent for a graph query. Always state the access limit.")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": msg + note}}))
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Exception:
+        pass
+    sys.exit(0)

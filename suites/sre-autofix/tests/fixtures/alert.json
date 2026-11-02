@@ -1,0 +1,2 @@
+{"fingerprint": "deadbeefcafe0001", "rule_uid": "rule-example-5xx", "subject": "example-api",
+ "title": "example-api 5xx rate above threshold", "eval_epoch": 1786440000, "window_sec": 300}

@@ -1,0 +1,61 @@
+# Team AI-usage report — auto-aggregate on push (ai-usage-weekly #198).
+#
+# Copy this file into your team's *private* reports repo (the one `scripts/ai-usage-weekly submit`
+# writes to). Every push that touches reports/<week>/ re-renders reports/<week>/team-report.html + .md
+# and commits them back, so the lead opens a link instead of running anything locally, and the
+# 未提交 list comes from reports/team.json automatically.
+# Changes to team.json, budget.json, or requests/*.json refresh all stored submission weeks.
+#
+# Secrets: none beyond the job's own GITHUB_TOKEN — never a team-wide key (rules/access-and-credentials.md).
+# The template repo is read with that same token, which works when it is public or in the same org
+# with "Actions → Access" allowed; otherwise vendor the template into this repo (git subtree under
+# tools/template/) and point TEMPLATE_PATH there — do not add a PAT.
+name: team-report
+on:
+  push:
+    branches: [main]
+    paths: ["reports/**"]
+permissions:
+  contents: write
+concurrency:
+  group: team-report-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO || 'olaola-chat/ai-native-workspace-template' }}
+  TEMPLATE_REF: ${{ vars.TEMPLATE_REF || 'main' }}
+  TEMPLATE_PATH: tools/template
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Checkout the workspace template (scripts/ai-usage-weekly + schema)
+        if: ${{ !hashFiles('tools/template/scripts/ai-usage-weekly') }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TEMPLATE_REPO }}
+          ref: ${{ env.TEMPLATE_REF }}
+          path: ${{ env.TEMPLATE_PATH }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Render the week(s) touched by this push
+        id: render
+        run: |
+          changed=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} -- reports/ || git ls-files reports/)
+          # shellcheck disable=SC2086
+          sh scripts/team-report.sh "$TEMPLATE_PATH" "$PWD" $changed
+      - name: Commit the rendered report back (no push of anyone's data — only team-report.*)
+        run: |
+          git config user.name "team-report[bot]"
+          git config user.email "team-report@users.noreply.github.com"
+          git add reports/*/team-report.html reports/*/team-report.md 2>/dev/null || true
+          git diff --cached --quiet && { echo "nothing to commit"; exit 0; }
+          git commit -m "team-report: re-render for ${{ github.sha }}"
+          git push
+      - name: Keep the HTML as a run artifact too
+        uses: actions/upload-artifact@v4
+        with:
+          name: team-report
+          path: reports/*/team-report.html
+          if-no-files-found: ignore

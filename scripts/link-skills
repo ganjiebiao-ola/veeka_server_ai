@@ -1,0 +1,82 @@
+#!/usr/bin/env sh
+# Point both runtimes' skill-discovery dirs at skills/ (the single source of truth):
+#   .claude/skills  (Claude Code)  and  .agents/skills  (Codex)  ->  ../skills
+# On Unix the two symlinks are committed, so this is only needed when they are missing
+# (e.g. a fresh Windows clone where git did not restore symlinks). Falls back to copy.
+set -e
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+# HARNESS_ROOT 在 source 之前设好（见 scripts/lib/harness.sh 顶部：被 source 的文件在 POSIX sh 下
+# 拿不到自己的路径，由 source 点把根传下去）。
+HARNESS_ROOT="$root"
+. "$root/scripts/lib/harness.sh"
+
+# _rm_path <path> —— 本脚本唯一的删除入口（security-defaults.md §2）。
+# 符号链接（含悬空链接）直接 rm -f：删的是链接本身、不会丢任何内容，而这正是"重新挂载 skills"的
+# 常规路径，所以不打扰人（新装 skill、修复丢失的软链都走这条，绝不会弹确认）。
+# copy 模式自己创建、打了 .link-skills-managed 标记的目录同样直接删——那是本脚本上一次运行留下的
+# 产物，删自己创建的东西不需要真人确认，否则每次重跑（包括无 tty 的自动化场景）都会卡在确认上，
+# copy 模式本身就是给不支持符号链接的环境兜底的，不能反过来要求它必须有交互终端。
+# 只有真正未知来源的目录/文件（没有这个标记）才是破坏性删除，必须过 harness_guard 由 /dev/tty 上
+# 的真人确认；被拦下就整体退出，绝不"静默继续删"。
+_rm_path() {
+  _p="$1"
+  if [ -L "$_p" ]; then rm -f "$_p"; return 0; fi
+  [ -e "$_p" ] || return 0
+  if [ -d "$_p" ] && [ -f "$_p/.link-skills-managed" ]; then
+    rm -rf "$_p"
+    return 0
+  fi
+  if ! harness_guard "rm -rf $_p" "$_p"; then
+    echo "link-skills: BLOCKED by the harness — $_p left untouched (see runs/harness-log.jsonl)" >&2
+    exit 1
+  fi
+  rm -rf "$_p"
+}
+
+for d in .claude .agents; do
+  mkdir -p "$d"
+  target="$d/skills"
+  _rm_path "$target.new"
+  if ln -s ../skills "$target.new" 2>/dev/null && [ -L "$target.new" ]; then
+    _rm_path "$target"
+    mv "$target.new" "$target"
+    echo "linked  $target -> ../skills"
+  else
+    _rm_path "$target.new"
+    _rm_path "$target"
+    mkdir -p "$target"
+    # Copy each skill individually with -L (dereference), since skills/ may itself hold symlinks
+    # into a repos/-mounted skills-source monorepo (see scripts/setup-skills) that would otherwise
+    # become dangling once copied outside skills/'s own relative-path context. A single stale/
+    # dangling entry (upstream skill deleted, symlink not yet cleaned up) falls back to a plain
+    # (possibly dangling) copy instead of aborting the whole directory.
+    for entry in skills/*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      name=$(basename "$entry")
+      if ! cp -RL "$entry" "$target/$name" 2>/dev/null; then
+        cp -R "$entry" "$target/$name"
+        echo "  WARN: $name copied as a (possibly dangling) symlink — check its upstream source"
+      fi
+    done
+    # 标记这个目录是本脚本创建的，好让下次重跑时 _rm_path 免过 harness_guard（见上）。
+    touch "$target/.link-skills-managed"
+    # 幂等：`grep -qx` 按整行精确匹配，已存在就不再追加（重复运行不会写重复行）；.gitignore 不存在
+    # 时 grep 的报错被丢弃、`>>` 直接建文件，所以这条副作用重跑多少次都安全。
+    grep -qx "/$target" .gitignore 2>/dev/null || printf '/%s\n' "$target" >> .gitignore
+    echo "copied  skills -> $target  (symlink unsupported; copy is gitignored)"
+  fi
+done
+
+# Team-native skills (team-context/skills/<id>/, framework-tracked, team-owned — platform-internals/
+# ownership.yaml) are linked into the mount point so both runtimes discover them beside the bundled and
+# mounted ones. Symlinks under skills/ are gitignored, so nothing is tracked twice.
+for src in team-context/skills/*/; do
+  [ -d "$src" ] || continue
+  id=$(basename "$src")
+  if [ -e "skills/$id" ] && [ ! -L "skills/$id" ]; then
+    echo "  WARN: skills/$id exists and is not a symlink — team skill '$id' not linked"; continue
+  fi
+  ln -sfn "../team-context/skills/$id" "skills/$id" && echo "linked  skills/$id -> ../team-context/skills/$id"
+done

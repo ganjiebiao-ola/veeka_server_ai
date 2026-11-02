@@ -1,0 +1,31 @@
+# HolmesGPT custom toolset: Aliyun SLS through the department Grafana (/api/ds/query).
+# The script reads GRAFANA_URL / GRAFANA_SERVICE_ACCOUNT_TOKEN from the container env — nothing
+# credential-shaped may appear in a `command:` (suite `test` ports the reference's toolset guard).
+# Parameters are rendered with shlex.quote by Holmes, so SQL with spaces/quotes travels intact.
+# Optional parameters use the `--flag={{ param }}` form: an omitted or "" value renders as `--flag=`
+# (argparse accepts an empty value; the script treats "" as unset) instead of swallowing the next flag.
+toolsets:
+  sre-inspect/grafana-sls:
+    description: "查阿里云 SLS 日志（检索 | SQL 分析），经部门 Grafana 的 SLS 数据源。先 sls_list_datasources 选数据源（每个数据源绑定一个 project/logstore），logstore 可按查询覆盖。"
+    tags:
+      - core
+    prerequisites:
+      - command: "python3 /tools/grafana-sls/sls_query.py datasources >/dev/null"
+    llm_instructions: |
+      规则细则见 skill `grafana-sls`（fetch_skill）。铁律：索引快照先行，只用快照里存在的字段；检索段（`|` 左侧）
+      含冒号的 key 不加双引号（`__tag__:__hostname__: "host"`）；SQL 段只用开了统计的列，未开统计的列会静默返回 null；
+      先 count(*)/GROUP BY 探量再拉原文，拉原文显式投影 + LIMIT ≤ 50；from/to 只用注入的 epoch，不做时区算术；
+      输出首行 `# …` 带 project/logstore/rows/truncated，`error:` 行原样带回 SLS 的 ParameterInvalid 等信息。
+    tools:
+      - name: sls_list_datasources
+        description: "列出 Grafana 里的 SLS 数据源：name / uid / project / 默认 logstore。"
+        command: "python3 /tools/grafana-sls/sls_query.py datasources"
+      - name: sls_list_logstores
+        description: "列出某个 SLS 数据源所属 project 下的全部 logstore（用于 --logstore 覆盖）。"
+        command: "python3 /tools/grafana-sls/sls_query.py logstores --datasource {{ datasource }}"
+      - name: sls_query
+        description: "对数据源执行 SLS 查询（'<检索段> | <SQL 段>' 或纯检索）。datasource=uid 或 name；logstore 留空用数据源默认；from/to 用注入的 epoch 秒或毫秒；limit 是总行数（默认 50，最大 200），SQL 自己写 LIMIT。"
+        command: "python3 /tools/grafana-sls/sls_query.py query --datasource {{ datasource }} --logstore={{ logstore }} --query {{ query }} --from {{ from }} --to {{ to }} --limit={{ limit }}"
+      - name: sls_context
+        description: "某主机某时刻前后 N 秒的原始日志（插件无上下文接口的合成替代）。hostname 是 __tag__:__hostname__ 的值；ts 为 epoch；before/after 秒（留空各 30）。"
+        command: "python3 /tools/grafana-sls/sls_query.py context --datasource {{ datasource }} --logstore={{ logstore }} --hostname {{ hostname }} --ts {{ ts }} --before={{ before }} --after={{ after }}"

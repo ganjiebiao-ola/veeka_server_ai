@@ -1,0 +1,30 @@
+diff --git a/app/service/ExampleSrv.php b/app/service/ExampleSrv.php
+index 7b7e22f..579ffd6 100644
+--- a/app/service/ExampleSrv.php
++++ b/app/service/ExampleSrv.php
+@@ -8,14 +8,21 @@ class ExampleSrv
+ 			return false;
+ 		}
+ 
+-		// check if enabled
+-		$res = RpcExample::IsFeatureEnabled($uid);
++		// check if enabled; degrade to false on RPC failure rather than surfacing a 500
++		try {
++			$res = RpcExample::IsFeatureEnabled($uid);
++		} catch (\Throwable $e) {
++			Helper::debugger()->warning('IsFeatureEnabled RPC exception, degrading to false. uid=' . $uid . ' err=' . $e->getMessage());
++			return false;
++		}
+ 		Helper::debugger()->info('IsFeatureEnabled res: ' . json_encode($res));
+ 		if ($res === false || empty($res)) {
+-			throw new \Exception(__T('ERROR_SERVICE_ABNORMAL_TRY_AGAIN'));
++			Helper::debugger()->warning('IsFeatureEnabled RPC returned empty/false, degrading to false. uid=' . $uid);
++			return false;
+ 		}
+ 		if (is_string($res)) {
+-			throw new \Exception($res);
++			Helper::debugger()->warning('IsFeatureEnabled RPC returned error string, degrading to false. uid=' . $uid . ' err=' . $res);
++			return false;
+ 		}
+ 
+ 		// not enabled

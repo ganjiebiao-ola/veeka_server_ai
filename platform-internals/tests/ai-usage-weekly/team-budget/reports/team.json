@@ -1,0 +1,9 @@
+{
+ "team": "fixture-team",
+ "members": [
+  "alice",
+  "bob"
+ ],
+ "timezone": "Asia/Singapore",
+ "business": "fixture-biz"
+}

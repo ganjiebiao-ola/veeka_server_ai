@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Check path ownership against platform-internals/ownership.yaml (framework | seed | generated | team).
+
+Zero-dependency (stdlib only), a sibling of check-workspace. Three checks:
+  1. ownership.yaml parses and every listed path exists in the tree (a stale entry is drift);
+  2. every tracked file classified seed/generated carries `merge=ours` in .gitattributes and no framework
+     file does (git check-attr) — so a downstream `git merge upstream/<branch>` keeps the team's copy of
+     its files and still receives every framework change;
+  3. if workspace.yaml declares `upstream:` (url, branch, synced_commit), every framework-owned path in
+     the working tree is byte-identical to that upstream commit — the guard behind "change upstream
+     first, then sync". No `upstream:` block = this checkout is the template itself → SKIP that check.
+
+Exit: 0 OK, 2 WARN (pinned commit not present locally — fetch it, cannot compare), 1 FAIL.
+argv[1] optionally overrides the workspace root (the sync fixture points it at a temp repo).
+"""
+import pathlib
+import re
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
+CLASSES = ("framework", "seed", "generated")
+
+
+def git(*args, check=True):
+    r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"ERROR: git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r
+
+
+def load_ownership(path):
+    """Tiny hand-parse: `<class>:` sections holding `  - <path>` items; comments and blank lines ignored."""
+    lists = {c: [] for c in CLASSES}
+    current = None
+    for raw in path.read_text().splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        m = re.match(r"^([a-z]+):\s*$", line)
+        if m:
+            current = m.group(1) if m.group(1) in CLASSES else None
+            continue
+        m = re.match(r"^\s*-\s+(\S+)\s*$", line)
+        if m and current:
+            lists[current].append(m.group(1))
+    return lists
+
+
+def classify(path, lists):
+    best_len, best_cls = -1, "team"
+    for cls in CLASSES:
+        for p in lists[cls]:
+            hit = path.startswith(p) if p.endswith("/") else path == p
+            if hit and len(p) > best_len:
+                best_len, best_cls = len(p), cls
+    return best_cls
+
+
+def upstream_block(wsfile):
+    """Read `upstream:` {url, branch, synced_commit} from workspace.yaml (2-space-indented keys)."""
+    if not wsfile.exists():
+        return None
+    block, inside = {}, False
+    for raw in wsfile.read_text().splitlines():
+        if re.match(r"^upstream:\s*(#.*)?$", raw):
+            inside = True
+            continue
+        if inside:
+            m = re.match(r"^  ([a-z_]+):\s*(.+?)\s*(#.*)?$", raw)
+            if m:
+                block[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+                continue
+            if raw.strip() and not raw.startswith((" ", "#")):
+                break
+    return block or None
+
+
+errors, warnings = [], []
+own_file = root / "platform-internals" / "ownership.yaml"
+if not own_file.exists():
+    print("FAIL: ownership")
+    print("  - missing platform-internals/ownership.yaml — the path-ownership contract (framework | seed |")
+    print("    generated | team) lives there; restore it from the template.")
+    sys.exit(1)
+lists = load_ownership(own_file)
+
+# 1. listed paths exist
+for cls in CLASSES:
+    for p in lists[cls]:
+        if not (root / p).exists():
+            errors.append(f"ownership.yaml lists {cls} path '{p}' but it does not exist — stale entry")
+
+# 2. tracked files classify; seed/generated carry merge=ours, framework does not
+tracked = [ln for ln in git("ls-files").stdout.splitlines() if ln.strip()]
+by_class = {c: [] for c in (*CLASSES, "team")}
+for f in tracked:
+    by_class[classify(f, lists)].append(f)
+attr = {}
+if tracked:
+    for line in git("check-attr", "merge", "--", *tracked).stdout.splitlines():
+        path, _, value = line.rpartition(": merge: ")
+        attr[path] = value.strip()
+for f in by_class["seed"] + by_class["generated"]:
+    if attr.get(f) != "ours":
+        errors.append(f"{f}: seed/generated file without `merge=ours` in .gitattributes (got '{attr.get(f)}')")
+for f in by_class["framework"]:
+    if attr.get(f) == "ours":
+        errors.append(f"{f}: framework file carries `merge=ours` — a sync would never update it (unanchored pattern in .gitattributes?)")
+
+# 3. framework paths identical to the pinned upstream commit
+up = upstream_block(root / "workspace.yaml")
+pin_state = "SKIP (no upstream: block — this is the template itself)"
+if up:
+    drv = git("config", "--get", "merge.ours.driver", check=False).stdout.strip()
+    if not drv:
+        warnings.append("merge.ours.driver is not set in this clone — run: git config merge.ours.driver 'scripts/lib/merge-keep-team %O %A %B' "
+                        "(the sync skill's preflight does this); until then merge=ours paths conflict instead of keeping ours")
+    elif "merge-keep-team" not in drv:
+        warnings.append(f"merge.ours.driver is '{drv}' — a plain driver keeps the WRONG side under `git rebase` (team edits to "
+                        f"seeds are silently dropped); set: git config merge.ours.driver 'scripts/lib/merge-keep-team %O %A %B'")
+    sha = up.get("synced_commit", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        errors.append(f"workspace.yaml upstream.synced_commit '{sha}' is not a full 40-hex commit sha")
+    elif git("cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode != 0:
+        warnings.append(f"pinned upstream commit {sha[:7]} is not present locally — run: git fetch "
+                        f"{up.get('url', '<upstream-url>')} {up.get('branch', 'main')}; cannot compare framework paths")
+        pin_state = "WARN (pin not fetched)"
+    else:
+        diff = git("diff", "--name-status", "--no-renames", sha, "--", *lists["framework"]).stdout.splitlines()
+        drift = [d for d in diff if classify(d.split("\t", 1)[1], lists) == "framework"]
+        if drift:
+            errors.append(f"framework-owned paths differ from upstream {sha[:7]} — change upstream first, then sync; "
+                          f"on a sync branch run scripts/upstream-pin <new-sha> after merging:")
+            errors.extend(f"  {d}" for d in drift)
+        pin_state = f"matches upstream {sha[:7]}"
+
+counts = ", ".join(f"{c} {len(by_class[c])}" for c in (*CLASSES, "team"))
+if errors:
+    print("FAIL: ownership")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+if warnings:
+    print(f"WARN: ownership ({counts}; framework vs pin: {pin_state})")
+    for w in warnings:
+        print("  -", w)
+    sys.exit(2)
+print(f"OK: ownership ({counts}; framework vs pin: {pin_state})")

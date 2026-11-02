@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Validate that every asset under a base dir (default: platform-internals/examples/) satisfies the #48 schema.
+
+Zero-dependency (stdlib only), a sibling of check-agents-sync. It reads
+platform-internals/schemas/asset-metadata.schema.json and checks each asset's YAML frontmatter for: required fields
+present, enum membership, id/version patterns, array-typed fields, and non-empty required strings.
+Override the base dir with argv[1] — same convention as check-asset-refs — so a team that has
+replaced the specimens with real assets points both checks at their production home.
+`--payload-ok` (#119) skips files with no frontmatter instead of failing them — for asset homes
+like a bundled skill dir, where templates/ and references/ are payload by design and only
+id-bearing files are asset records. Zero assets found still fails (see below).
+
+**Zero assets is a failure, not a pass.** A base dir with nothing to validate means coverage is zero;
+reporting `OK: 0 assets` would let a workspace that deleted its assets read as green while checking
+nothing. `platform-internals/tests/empty-asset-dir/` plants exactly that case for the self-test.
+
+It is a schema-conformance guard only. It does NOT run assets, resolve the pairing cross-references
+(evaluates/evaluator/regression targets), or judge health — those belong to #50. The frontmatter
+parser is deliberately tiny: it handles `key: scalar` and `key: [inline, list]`, which is all the
+specimens use; it is not a general YAML parser.
+"""
+import json
+import re
+import sys
+import pathlib
+
+root = pathlib.Path(__file__).resolve().parent.parent
+payload_ok = "--payload-ok" in sys.argv[1:]
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+base = pathlib.Path(args[0]).resolve() if args else root / "platform-internals" / "examples"
+
+schema_file = root / "platform-internals" / "schemas" / "asset-metadata.schema.json"
+if not schema_file.exists():
+    print("FAIL: asset-metadata schema conformance")
+    print(f"  - missing {schema_file.relative_to(root)} — the schema this check validates against.")
+    print("  - platform-internals/schemas/ is the self-proving layer; restore it rather than deleting it.")
+    sys.exit(1)
+
+schema = json.loads(schema_file.read_text())
+required = schema["required"]
+props = schema["properties"]
+
+
+def strip_quotes(s):
+    if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+        return s[1:-1]
+    return s
+
+
+def parse_value(val):
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        if not inner:
+            return []
+        return [strip_quotes(x.strip()) for x in inner.split(",")]
+    return strip_quotes(val)
+
+
+def parse_frontmatter(text):
+    m = re.match(r"^---\n(.*?)\n---", text, re.S)
+    if not m:
+        return None
+    data = {}
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        mm = re.match(r"^([A-Za-z_][\w-]*):\s?(.*)$", line.rstrip())
+        if mm:
+            data[mm.group(1)] = parse_value(mm.group(2).strip())
+    return data
+
+
+errors = []
+checked = 0
+
+if not base.is_dir():
+    print("FAIL: asset-metadata schema conformance")
+    print(f"  - base dir does not exist: {base}")
+    sys.exit(1)
+
+for f in sorted(base.rglob("*.md")):
+    if f.name == "README.md":
+        continue
+    try:
+        rel = f.relative_to(root)
+    except ValueError:
+        rel = f
+    data = parse_frontmatter(f.read_text())
+    if data is None:
+        if not payload_ok:
+            errors.append(f"{rel}: no YAML frontmatter")
+        continue
+    checked += 1
+
+    for field in required:
+        if field not in data:
+            errors.append(f"{rel}: missing required field '{field}'")
+
+    for field, spec in props.items():
+        if field not in data:
+            continue
+        val = data[field]
+        if "enum" in spec and val not in spec["enum"]:
+            errors.append(f"{rel}: '{field}'='{val}' not in {spec['enum']}")
+        if "pattern" in spec:
+            if not isinstance(val, str) or not re.match(spec["pattern"], val):
+                errors.append(f"{rel}: '{field}'='{val}' does not match {spec['pattern']}")
+        if spec.get("type") == "array" and not isinstance(val, list):
+            errors.append(f"{rel}: '{field}' must be a list")
+        if spec.get("type") == "string" and not isinstance(val, str):
+            errors.append(f"{rel}: '{field}' must be a string")
+        if "minLength" in spec and isinstance(val, str) and len(val) < spec["minLength"]:
+            errors.append(f"{rel}: '{field}' is shorter than minLength {spec['minLength']}")
+
+try:
+    where = base.relative_to(root)
+except ValueError:
+    where = base
+
+if checked == 0:
+    errors.append(
+        f"no assets found under {where}/ — zero coverage is not a pass. Either this directory "
+        "still holds the #48 specimens, or it points at the team's real assets; empty means the "
+        "check validated nothing."
+    )
+
+if errors:
+    print("FAIL: asset-metadata schema conformance")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+
+print(f"OK: {checked} assets under {where}/ conform to platform-internals/schemas/asset-metadata.schema.json")

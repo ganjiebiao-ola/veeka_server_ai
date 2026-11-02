@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Security audit findings",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "id",
+      "category",
+      "severity",
+      "file",
+      "line",
+      "snippet",
+      "fix_summary",
+      "status",
+      "reason"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$",
+        "maxLength": 64
+      },
+      "kind": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+        "maxLength": 40
+      },
+      "category": {
+        "type": "string",
+        "enum": [
+          "sqli",
+          "cmd-injection",
+          "deserialization",
+          "signature-compare",
+          "numeric-juggling",
+          "path-ssrf",
+          "weak-hash",
+          "log-leak",
+          "cors",
+          "hardcoded-secret",
+          "dead-code",
+          "weak-random",
+          "tls-verify-off",
+          "mass-assignment",
+          "loose-compare",
+          "api-no-auth",
+          "api-test-exposed",
+          "deps-gadget",
+          "vendor-cve",
+          "api-retired",
+          "misc"
+        ]
+      },
+      "severity": {
+        "type": "string",
+        "enum": [
+          "P0",
+          "P1",
+          "P2"
+        ]
+      },
+      "file": {
+        "type": "string",
+        "minLength": 1
+      },
+      "line": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "snippet": {
+        "type": "string"
+      },
+      "fix_summary": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "open",
+          "in progress",
+          "ignored",
+          "candidate",
+          "false positive",
+          "fixed",
+          "needs human"
+        ]
+      },
+      "reason": {
+        "type": "string"
+      }
+    }
+  }
+}

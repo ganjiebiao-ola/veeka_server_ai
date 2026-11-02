@@ -1,0 +1,10 @@
+{
+  "actual": {"amount": 12.5, "currency": "USD", "nature": "seat", "source": "subscription-ledger 2026-08",
+             "period": {"since": "2026-08-01", "until": "2026-08-31"}, "confirmed": true},
+  "allocated": {"amount": 7.5, "currency": "USD", "nature": "seat", "source": "subscription-ledger 2026-08",
+                "period": {"since": "2026-08-10", "until": "2026-08-16"}, "confirmed": true,
+                "basis": "服务周期折算到报告周"},
+  "allocation": [{"target": "alpha", "ratio": 60}, {"target": "workspace", "ratio": 40}],
+  "shared_costs": [],
+  "confirmed_by": {"billing": "bob", "attribution": "bob"}
+}

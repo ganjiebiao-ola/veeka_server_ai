@@ -1,0 +1,132 @@
+{
+  "claude": {
+    "label": "Claude",
+    "driver": "claude",
+    "transport": "sdk",
+    "canFix": true,
+    "models": [
+      {
+        "value": "fable",
+        "label": "Fable 5",
+        "disabled": true
+      },
+      {
+        "value": "opus",
+        "label": "Claude Opus 5.5"
+      },
+      {
+        "value": "sonnet",
+        "label": "Claude Sonnet 5.5"
+      },
+      {
+        "value": "haiku",
+        "label": "Claude Haiku 5.5"
+      }
+    ],
+    "efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "defaultModel": "sonnet",
+    "defaultEffort": "medium",
+    "command": [],
+    "auth": "claude",
+    "modes": {
+      "scan": "read-only",
+      "review": "read-only",
+      "fix": "workspace-write"
+    },
+    "unavailableReason": ""
+  },
+  "codex": {
+    "label": "Codex",
+    "driver": "codex",
+    "transport": "native",
+    "canFix": true,
+    "models": [
+      {
+        "value": "gpt-6.1-sol",
+        "label": "GPT-6.1 Sol"
+      }
+    ],
+    "efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "defaultModel": "gpt-6.1-sol",
+    "defaultEffort": "medium",
+    "command": [
+      "codex"
+    ],
+    "auth": "codex",
+    "modes": {
+      "scan": "read-only",
+      "review": "read-only",
+      "fix": "workspace-write"
+    },
+    "unavailableReason": ""
+  },
+  "antigravity": {
+    "label": "Antigravity",
+    "driver": "antigravity",
+    "transport": "native",
+    "canFix": true,
+    "models": [
+      {
+        "value": "gemini-3.8-flash",
+        "label": "Gemini 3.8 Flash"
+      },
+      {
+        "value": "gemini-4-argon",
+        "label": "Gemini 4 Argon"
+      }
+    ],
+    "efforts": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "defaultModel": "gemini-3.8-flash",
+    "defaultEffort": "high",
+    "command": [
+      "agy"
+    ],
+    "auth": "antigravity",
+    "modes": {
+      "scan": "read-only",
+      "review": "read-only",
+      "fix": "workspace-write"
+    },
+    "unavailableReason": ""
+  },
+  "qoder": {
+    "label": "Qoder",
+    "driver": "qoder",
+    "transport": "native",
+    "canFix": true,
+    "models": [
+      {
+        "value": "Qwen3.8-Flash",
+        "label": "Qwen3.8-Flash"
+      }
+    ],
+    "efforts": [],
+    "defaultModel": "Qwen3.8-Flash",
+    "defaultEffort": "",
+    "command": [
+      "qodercli"
+    ],
+    "auth": "qoder",
+    "modes": {
+      "scan": "read-only",
+      "review": "read-only",
+      "fix": "workspace-write"
+    },
+    "unavailableReason": ""
+  }
+}

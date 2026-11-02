@@ -1,0 +1,26 @@
+{
+  "daily": [
+    {
+      "period": "2026-08-10",
+      "inputTokens": 600,
+      "outputTokens": 200,
+      "cacheReadTokens": 400,
+      "cacheCreationTokens": 0,
+      "totalCost": 0.4,
+      "modelsUsed": ["gpt-fake"],
+      "agents": [
+        {
+          "agent": "codex",
+          "inputTokens": 600,
+          "outputTokens": 200,
+          "cacheReadTokens": 400,
+          "cacheCreationTokens": 0,
+          "modelBreakdowns": [
+            {"modelName": "gpt-fake", "inputTokens": 600, "outputTokens": 200, "cost": 0.4}
+          ]
+        }
+      ]
+    }
+  ],
+  "totals": {"inputTokens": 600, "outputTokens": 200, "cacheReadTokens": 400, "cacheCreationTokens": 0, "totalCost": 0.4}
+}

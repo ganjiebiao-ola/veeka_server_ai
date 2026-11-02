@@ -1,0 +1,1 @@
+{"type": "assistant", "timestamp": "2026-08-12T03:00:00.000Z", "cwd": "/fake/ws", "sessionId": "q-sess-2", "message": {"id": "q-msg-2", "model": "auto", "role": "assistant", "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "credits": 0.25, "billable": true, "request_id": "r"}}}

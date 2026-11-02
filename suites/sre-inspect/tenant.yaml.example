@@ -1,0 +1,73 @@
+# suites/sre-inspect/tenant.yaml — the department's structured configuration (schema_version 1).
+# TEMPLATE: copy to tenant.yaml (tracked in the department's workspace instance) or to
+# tenant.local.yaml (gitignored — for trying the template checkout against a real Grafana).
+# Parsed by lib/yamlmini.py (hand-walked subset: scalars, nested maps, `- ` lists, inline [a, b]
+# and {k: v}; no anchors, no block scalars). Non-secret configuration lives HERE, never in env;
+# the only secrets are in env/.env.holmes (see env/holmes-env.example).
+schema_version: 1
+
+tenant:
+  id: example                      # short id; appears in report.json tenant block
+  display_name: "Example department"
+  timezone: Asia/Singapore         # IANA name (python >= 3.9) or a fixed offset like +08:00
+
+grafana:
+  url: https://grafana.example.internal    # must equal GRAFANA_URL in env/.env.holmes (doctor checks)
+  org_id: 1
+  # Datasources the agent may use. `datasource:` = the Grafana DATASOURCE's display name (exactly
+  # as `run sls datasources --all-types` prints it; org-unique; NOT a metric name — metric names
+  # like AliyunEcs_CPUUtilization are discovered at runtime, never configured). One SLS datasource per logstore is the common
+  # shape (the plugin binds project+logstore at datasource level; logstore can be overridden per
+  # query).
+  # project/logstore are cross-checked against Grafana by `run doctor`.
+  datasources:
+    logs:                              # SLS log datasources
+      - datasource: log_nginx_access
+        project: app-logs
+        logstore: nginx-access
+      - datasource: log_app
+        project: app-logs
+        logstore: app
+    metrics:                           # Prometheus datasources (the "metrics role")
+      - datasource: prom-cms           # carries cloud monitor metrics (AliyunEcs_* / AliyunRds_*)
+      - datasource: prom-app           # carries self-instrumented app metrics (nsq_* / rpc_*)
+  default_logs_datasource: log_nginx_access
+  # doctor / spike targets: one cheap query on each
+  probe:
+    logs_datasource: log_nginx_access
+    metrics_datasource: prom-cms
+
+alert_source:
+  adapter: grafana                 # Alertmanager firing + alert state history (annotations); Slack is not a source
+  lookback: 24h                    # default `run intake` window
+  # which label names a "subject" (instance / API path / topic …) — first present wins
+  subject_labels: [instance, api, topic, processGroup, hostName, host]
+  # Mirror your Grafana notification policy here: what never reaches the on-call channel should
+  # not reach the queue either. Both maps are label -> [accepted values].
+  filter:
+    include_labels: {environment: [production]}
+    exclude_labels: {severity: [info]}
+
+routing:
+  file: routes.yaml                # rule_uid -> RID / triage template / known_bug (routes.local.yaml wins if present)
+
+# Deploy facts (L7 change surface) from GitHub Actions, read with the operator's own `gh`.
+# Used only as input to a dive (never as a trigger). Empty list = "L7 未接入" in INSPECT.md.
+# List EVERY repo whose build can land on the hosts you alert on (the PHP monolith as well as the Go
+# services) — a repo missing here makes its releases invisible to the dive (first real run: a 502
+# burst 90 s after a PHP build had no matching row because only the Go repos were listed).
+deploys:
+  - repo: example-org/example-service
+    workflow: "Production Deploy"
+
+ledger:
+  cooldown: 30m                    # same fingerprint while the incident is open -> folded, not re-opened
+  recurrence: 14d                  # same fingerprint after close -> marked as recurrence of the previous incident
+
+knowledge:
+  triage_dir: triage               # your triage/*.md templates (placeholders: see triage/README.md)
+  skills: [grafana-sls]            # skills the brief tells the agent to read for querying
+  background_skill: ""             # optional: name of your project-background skill (Holmes custom_skill_paths / workspace skills/)
+
+holmes:
+  enabled: false                   # optional local HolmesGPT (holmes/docker-compose.yaml); Claude Code / Codex need none of it

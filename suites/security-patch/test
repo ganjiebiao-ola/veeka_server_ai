@@ -1,0 +1,50 @@
+#!/usr/bin/env sh
+# suites/security-patch/test — suite tests (#43 convention). Offline: a fake codesec API on localhost,
+# the operator skill's smoke, and portability guards. Runs under `ws test` and `ws regression`.
+set -u
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root="$(CDPATH= cd -- "$here/../.." && pwd)"
+case "${1:-}" in
+  "") app= ;;
+  --app) app=all ;;
+  --app=scanner|--app=backend|--app=frontend) app="${1#--app=}" ;;
+  *) echo "usage: test [--app[=scanner|backend|frontend]]" >&2; exit 2 ;;
+esac
+rc=0
+out="$(cd "$here" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t tests -p 'test_*.py' 2>&1)" || rc=1
+printf '%s\n' "$out" | tail -n 3
+ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9]*\) tests\{0,1\}.*/\1/p' | tail -n 1)"
+[ -n "$ran" ] && [ "$ran" -gt 0 ] || { echo "FAIL: security-patch: no tests ran (vacuous green refused)"; rc=1; }
+"$root/skills/security-patch/regression/smoke.sh" "$root" || rc=1
+grep -q "^id: security-patch$" "$here/SUITE.md" || { echo "FAIL: SUITE.md id != security-patch"; rc=1; }
+grep -q "^entry: suites/security-patch/$" "$here/SUITE.md" || { echo "FAIL: SUITE.md entry != suites/security-patch/"; rc=1; }
+# portability: no mounted-repo id in the suite's content files
+# Repo ids come from workspace.yaml and the gitignored workspace.local.yaml, so the guard can name a
+# locally mounted pilot repo without that name ever entering a tracked file.
+ids=$(cat "$root/workspace.yaml" "$root/workspace.local.yaml" 2>/dev/null | awk '/^repositories:/{f=1;next} /^[A-Za-z_]/{f=0} f && /^[[:space:]]*- id:/{sub(/.*- id:[[:space:]]*/,""); print}')
+for id in $ids; do
+  if grep -rlFw --exclude-dir=__pycache__ --exclude-dir=targets --exclude-dir=tests --exclude='*.test.*' -- "$id" "$here/lib" "$here/docs" "$here/run" "$here/SUITE.md" "$here/config.yaml" "$here/app/skill"; then
+    echo "FAIL: mounted-repo id leaked into suite files: $id"; rc=1
+  fi
+done
+# Fixed pilot identifiers must stay in ignored target notes or test fixtures.
+# grep, not rg: CI runners have no ripgrep.
+if grep -rlE --exclude-dir=targets --exclude-dir=tests --exclude='*.test.*' 'bms-payment|pt-oversea|olaola-chat|cli/room/vendor|Helper\.php|RedisBase|phpnsq|StageRoomTypeCheck|ApplicationVar|server/' "$here/app/skill"; then
+  echo "FAIL: pilot-specific text leaked into the audit skill"; rc=1
+fi
+# SKIP_SCANNER_IMAGE=1 skips the image build and its Docker sandbox test. CI runs those in
+# security-patch-sandbox.yml, only when the image inputs change.
+case "$app" in all|scanner)
+  if [ "${SKIP_SCANNER_IMAGE:-}" = 1 ]; then
+    (cd "$here/app" && bun run test) || rc=1
+  else
+    (cd "$here/app" &&
+      docker build -f scanner/Dockerfile -t ola-agent-scanner:test . &&
+      CODEX_SANDBOX_TEST=1 bun run test) || rc=1
+  fi ;;
+esac
+case "$app" in all|backend) (cd "$here/app/backend" && bun run test && bun run check) || rc=1 ;; esac
+case "$app" in all|frontend) (cd "$here/app/frontend" && bun run test && bun run typecheck && bun run build) || rc=1 ;; esac
+find "$here" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+[ "$rc" = 0 ] && echo "OK: security-patch test passed ($ran unit tests + 1 skill smoke)" || echo "FAIL: security-patch test"
+exit $rc

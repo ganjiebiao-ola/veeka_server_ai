@@ -1,0 +1,19 @@
+{
+  "name": "ola-agent-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch cli/server.ts",
+    "start": "bun cli/server.ts",
+    "check": "bun --bun run tsc --noEmit",
+    "test": "bun test",
+    "tracker:seed": "bun cli/seed_tracker.ts"
+  },
+  "dependencies": {
+    "hono": "4.12.22"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "^5.6.2"
+  }
+}

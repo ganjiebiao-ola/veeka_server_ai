@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Precheck the local permissions this workspace needs — reusing the operator's own permissions.
+
+Zero-dependency (stdlib only), a sibling of check-asset-metadata. Delivered by #50. Reads
+`required_local_permissions` from workspace.yaml and, for each {mechanism, check, guide} entry, runs
+its `check` and reports the verdict; on failure it prints the `guide` (guidance, not a bare error).
+
+Verdicts:
+  - OK       : check command exited 0 (permission present).
+  - MISSING  : check command exited non-zero → prints guide. Exit code 1 (a real gap).
+  - TODO     : check contains TODO → not configured yet; prints guide. Not a failure.
+  - SKIP     : a plain-string (legacy) entry → no machine check possible; suggests structuring it.
+
+Only MISSING makes this script exit non-zero, so an unconfigured (TODO) or legacy entry never blocks
+`health`. check commands come from workspace.yaml, a framework-tracked trusted source.
+"""
+import re
+import subprocess
+import sys
+import pathlib
+
+root = pathlib.Path(__file__).resolve().parent.parent
+text = (root / "workspace.yaml").read_text()
+
+
+def unquote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+        return s[1:-1]
+    return s
+
+
+# --- parse the required_local_permissions block (list of maps or plain strings) ---
+entries = []
+cur = None
+in_block = False
+for raw in text.splitlines():
+    if re.match(r"^required_local_permissions:\s*$", raw):
+        in_block = True
+        continue
+    if not in_block:
+        continue
+    if re.match(r"^[A-Za-z_]", raw):        # next top-level key → block ends
+        break
+    if not raw.strip() or raw.strip().startswith("#"):
+        continue
+    m = re.match(r"^\s*-\s*(.*)$", raw)      # list item start
+    if m:
+        if cur is not None:
+            entries.append(cur)
+        rest = m.group(1)
+        km = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", rest)
+        cur = {km.group(1): unquote(km.group(2))} if km else {"_freetext": rest.strip()}
+    else:                                    # continuation field of current map entry
+        km = re.match(r"^\s+([A-Za-z_][\w-]*):\s*(.*)$", raw)
+        if km and cur is not None:
+            cur[km.group(1)] = unquote(km.group(2))
+if cur is not None:
+    entries.append(cur)
+
+if not entries:
+    print("OK: no required_local_permissions declared")
+    sys.exit(0)
+
+missing = 0
+ran = 0          # entries whose `check` actually executed (TODO/SKIP entries did not)
+for e in entries:
+    if "_freetext" in e:
+        print(f"  SKIP  {e['_freetext']}  (plain-string entry; structure as {{mechanism,check,guide}} to precheck)")
+        continue
+    mech = e.get("mechanism", "?")
+    check = e.get("check", "")
+    guide = e.get("guide", "")
+    if "TODO" in check:
+        print(f"  TODO  {mech}: not configured — {guide}")
+        continue
+    rc = subprocess.run(check, shell=True, capture_output=True).returncode
+    ran += 1
+    if rc == 0:
+        print(f"  OK    {mech}: `{check}`")
+    else:
+        print(f"  MISSING {mech}: `{check}` exited {rc} → {guide}")
+        missing += 1
+
+if missing:
+    print(f"FAIL: {missing} local permission(s) missing")
+    sys.exit(1)
+# Count only what actually ran: a TODO/SKIP entry was never prechecked, and folding it into
+# "checked" would read as coverage this script did not provide.
+print(f"OK: {ran}/{len(entries)} local-permission entries checked (no missing;"
+      f" {len(entries) - ran} TODO/SKIP not checked)")

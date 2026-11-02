@@ -1,0 +1,3 @@
+source,nature,currency,amount,since,until,confirmed
+Claude Team seat 2026-09 (invoice INV-0912),seat,USD,200,2026-09-01,2026-09-30,true
+Unified API gateway 2026-W37 statement,api,USD,37.80,2026-09-07,2026-09-13,true

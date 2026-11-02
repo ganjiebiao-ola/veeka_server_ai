@@ -1,0 +1,70 @@
+{
+  "sqli": {
+    "php": "any",
+    "framework": "any"
+  },
+  "cmd-injection": {
+    "php": "any",
+    "framework": "any"
+  },
+  "deserialization": {
+    "php": "any",
+    "framework": "any"
+  },
+  "signature-compare": {
+    "php": "any",
+    "framework": "any"
+  },
+  "numeric-juggling": {
+    "php": "any",
+    "framework": "any"
+  },
+  "path-ssrf": {
+    "php": "any",
+    "framework": "any"
+  },
+  "weak-hash": {
+    "php": "any",
+    "framework": "any"
+  },
+  "log-leak": {
+    "php": "any",
+    "framework": "any"
+  },
+  "cors": {
+    "php": "any",
+    "framework": "any"
+  },
+  "hardcoded-secret": {
+    "php": "any",
+    "framework": "any"
+  },
+  "dead-code": {
+    "php": "any",
+    "framework": "any"
+  },
+  "tls-verify-off": {
+    "php": "any",
+    "framework": "any"
+  },
+  "weak-random": {
+    "php": "any",
+    "framework": "any"
+  },
+  "mass-assignment": {
+    "php": "any",
+    "framework": "phalcon"
+  },
+  "loose-compare": {
+    "php": "<8",
+    "framework": "any"
+  },
+  "api-no-auth": {
+    "php": "any",
+    "framework": "any"
+  },
+  "api-test-exposed": {
+    "php": "any",
+    "framework": "any"
+  }
+}

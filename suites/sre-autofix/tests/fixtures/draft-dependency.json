@@ -1,0 +1,60 @@
+{
+  "title": "example-api /feature/status 500：RPC 返回空时 ExampleSrv 抛未捕获异常",
+  "severity": "medium",
+  "severity_basis": "30 分钟窗内 42 次 500，占该接口请求 3.1%，无级联影响",
+  "impact_scope": "接口 /feature/status；调用它的客户端首页开关",
+  "impact_magnitude": "42 次 500 / 1352 次请求（3.1%），持续 28 分钟",
+  "impact_time_window": "1786439000–1786440680 (epoch)",
+  "repro_conditions": "下游 RpcExample::IsFeatureEnabled 返回 false/空时，ExampleSrv.php:21 直接 throw",
+  "repro_frequency": "间歇：与下游返回空的比例一致",
+  "root_cause_statement": "下游名字解析瞬断导致 RpcExample 调用抛异常，经 ExampleSrv.php:21 传播为 500",
+  "root_cause_chain": [
+    "[数据] t=1786439012 起 app 日志出现 Exception ERROR_SERVICE_ABNORMAL_TRY_AGAIN，File: ExampleSrv.php:21",
+    "[数据] 同窗 RPC 侧日志显示 IsFeatureEnabled 对 3% 请求返回空（下游灰度中）",
+    "[推断] ExampleSrv 未区分「下游按契约返回空」与「下游故障」，两者都抛异常 → 500"
+  ],
+  "confidence": "high",
+  "confidence_basis": "异常栈直接指向 ExampleSrv.php:21，且 RPC 返回空的比例与 500 比例吻合",
+  "evidence": [
+    {
+      "claim": "500 由 ExampleSrv.php:21 的异常引起",
+      "tool": "sls_execute_sql",
+      "tool_call_id": "call_0001",
+      "query": "* and \"ExampleSrv.php:21\" and level:ERROR",
+      "time_window": "1786439000–1786440680",
+      "excerpt": "42 hits, all: Exception ERROR_SERVICE_ABNORMAL_TRY_AGAIN File: ExampleSrv.php:21"
+    },
+    {
+      "claim": "RPC 对 3% 请求返回空，与 500 比例一致",
+      "tool": "sls_execute_sql",
+      "tool_call_id": "call_0002",
+      "query": "* and \"IsFeatureEnabled\" | select count(*) where res='' ",
+      "time_window": "1786439000–1786440680",
+      "excerpt": "41 empty responses of 1352"
+    },
+    {
+      "claim": "下游 RPC 服务本身健康，无错误率上升",
+      "tool": "execute_prometheus_range_query",
+      "tool_call_id": "call_0003",
+      "query": "sum(rate(rpc_errors_total{svc=\"example\"}[5m]))",
+      "time_window": "1786435400–1786440680",
+      "excerpt": "flat at 0"
+    }
+  ],
+  "excluded_hypotheses": [
+    {
+      "hypothesis": "下游 RPC 服务故障",
+      "why_ruled_out": "Prometheus 错误率为 0，返回空是灰度中的契约内行为"
+    }
+  ],
+  "data_gaps": [
+    "未拿到灰度开关的具体配置值"
+  ],
+  "cause_locus": "dependency_failure",
+  "cause_locus_basis": "仅在下游名字解析瞬断时才出错，代码只是传播路径",
+  "suggested_fix": "ExampleSrv.php 里区分「返回空=未启用」与真正的调用失败；返回空时应返回 false 而不是抛异常，修复后该场景不应再产生 500",
+  "suspect_change": "none",
+  "duplicate_of": "none",
+  "needs_human": false,
+  "needs_human_reason": "none"
+}

@@ -1,0 +1,12 @@
+{
+  "description": "Workspace code map: graphs are indexed per mounted repo (scripts/code-map-hook). Workspace freshness: is this clone behind origin's default branch (scripts/check-freshness)",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "d=\"$PWD\"; while [ \"$d\" != / ] && [ ! -x \"$d/scripts/code-map-hook\" ]; do d=$(dirname \"$d\"); done; [ -x \"$d/scripts/code-map-hook\" ] && exec \"$d/scripts/code-map-hook\"; exit 0", "timeout": 5 }] },
+      { "matcher": "startup|resume|clear", "hooks": [{ "type": "command", "command": "d=\"$PWD\"; while [ \"$d\" != / ] && [ ! -x \"$d/scripts/check-freshness\" ]; do d=$(dirname \"$d\"); done; [ -x \"$d/scripts/check-freshness\" ] && exec \"$d/scripts/check-freshness\" --hook; exit 0", "timeout": 10 }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "d=\"$PWD\"; while [ \"$d\" != / ] && [ ! -x \"$d/scripts/code-map-hook\" ]; do d=$(dirname \"$d\"); done; [ -x \"$d/scripts/code-map-hook\" ] && exec \"$d/scripts/code-map-hook\"; exit 0", "timeout": 5 }] }
+    ]
+  }
+}

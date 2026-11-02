@@ -1,0 +1,23 @@
+{
+  "incident": "INC-20260101-000000-deadbeef",
+  "checks": [
+    {
+      "name": "php -l app/service/ExampleSrv.php",
+      "runner": "docker run --rm php:7.2-cli",
+      "passed": true,
+      "output": "No syntax errors detected in app/service/ExampleSrv.php"
+    },
+    {
+      "name": "call-site audit: isFeatureEnabled",
+      "runner": "grep -rn \"isFeatureEnabled\" --include=*.php .",
+      "passed": true,
+      "output": "仅 1 个调用点 cli/run.php:5；改动不影响其他路径"
+    }
+  ],
+  "all_passed": true,
+  "not_verified": [
+    "无 PHPUnit 套件，未跑单元/集成测试",
+    "未在预发实跑接口"
+  ],
+  "notes": "PHP 7.2 语法检查用与项目同版本的 php:7.2-cli 镜像执行。"
+}

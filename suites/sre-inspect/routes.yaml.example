@@ -1,0 +1,23 @@
+# suites/sre-inspect/routes.yaml — Grafana alert rule uid -> route (port of the reference engine's
+# triage/route.go table, externalised). TEMPLATE: copy to routes.yaml (or routes.local.yaml).
+# One entry per rule you want triaged. Rules absent here are listed by `run intake` as unrouted —
+# never silently dropped — so the agent can propose an entry.
+rules:
+  - rule_uid: changeme00000001     # Grafana rule uid (14 chars; `alerting_manage_rules operation=list` shows them)
+    rid: R-01                      # your signal-catalog id
+    name: "API | 5XX"
+    layer: L2                      # L1 domain/CDN · L2 ingress · L3 queue · L4 data · L5 host · L6 process · L7 change
+    template: _template.md         # triage/<file>; write one per rule family (api-5xx.md, ecs-cpu.md …)
+  - rule_uid: changeme00000002
+    rid: R-05
+    name: "DTS | Sync Delay"
+    layer: L4
+    # deterministic verdict without a model: an alert whose text matches is a known rule bug
+    known_bug:
+      match: "[no value]"
+      reason: "NoData artefact of the rule (no_data_state=NoData + instant empty vector) — not a production anomaly"
+  - rule_uid: changeme00000003
+    rid: R-07
+    name: "ECS | CPU"
+    layer: L5
+    template: _template.md

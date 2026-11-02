@@ -1,0 +1,8 @@
+{
+  "actual": {"amount": 12.5, "currency": "USD", "nature": "seat", "source": "ledger",
+             "period": {"since": "2026-08-01", "until": "2026-08-31"}, "confirmed": true},
+  "allocated": null,
+  "allocation": [{"target": "alpha", "ratio": 60}, {"target": "workspace", "ratio": 30}],
+  "shared_costs": [],
+  "confirmed_by": {"billing": "bob"}
+}

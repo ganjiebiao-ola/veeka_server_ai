@@ -1,0 +1,9 @@
+{
+  "version": "test-1",
+  "currency": "USD",
+  "per_million": {
+    "claude-fable-5":  {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_creation": 12.5},
+    "claude-sonnet-5": {"input": 2.0,  "output": 10.0, "cache_read": 0.2, "cache_creation": 2.5}
+  },
+  "codex": {"default": null}
+}

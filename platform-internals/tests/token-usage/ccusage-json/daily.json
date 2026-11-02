@@ -1,0 +1,47 @@
+{
+  "daily": [
+    {
+      "period": "2026-08-10",
+      "inputTokens": 1010,
+      "outputTokens": 405,
+      "cacheReadTokens": 1410,
+      "cacheCreationTokens": 5,
+      "totalCost": 1.63,
+      "modelsUsed": ["claude-fable-5", "claude-sonnet-5", "gpt-fake"],
+      "agents": [
+        {
+          "agent": "claude",
+          "inputTokens": 410,
+          "outputTokens": 205,
+          "cacheReadTokens": 1010,
+          "cacheCreationTokens": 5,
+          "modelBreakdowns": [
+            {"modelName": "claude-fable-5", "inputTokens": 210, "outputTokens": 105, "cost": 0.7},
+            {"modelName": "claude-sonnet-5", "inputTokens": 200, "outputTokens": 100, "cost": 0.53}
+          ]
+        },
+        {
+          "agent": "codex",
+          "inputTokens": 600,
+          "outputTokens": 200,
+          "cacheReadTokens": 400,
+          "cacheCreationTokens": 0,
+          "modelBreakdowns": [
+            {"modelName": "gpt-fake", "inputTokens": 600, "outputTokens": 200, "cost": 0.4}
+          ]
+        },
+        {
+          "agent": "gemini",
+          "inputTokens": 500,
+          "outputTokens": 50,
+          "cacheReadTokens": 0,
+          "cacheCreationTokens": 0,
+          "modelBreakdowns": [
+            {"modelName": "gemini-fake", "inputTokens": 500, "outputTokens": 50, "cost": 0.9}
+          ]
+        }
+      ]
+    }
+  ],
+  "totals": {"inputTokens": 1510, "outputTokens": 455, "cacheReadTokens": 1410, "cacheCreationTokens": 5, "totalCost": 2.53}
+}

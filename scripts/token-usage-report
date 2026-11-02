@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""Local token-usage report for this AI-Workspace (#32 S1).
+
+Reads the operator's LOCAL agent-session data — Claude Code (~/.claude/projects/*/*.jsonl,
+per-message usage), Codex (~/.codex/sessions/**/rollout-*.jsonl, session-level counters,
+best-effort) and Qoder (~/.qoder/projects/*/*.jsonl, per-message credits, no tokens) — and writes a sanitized usage report under runs/token-usage/ (gitignored).
+Zero-dependency: python3 stdlib + git, nothing else. Everything stays on this machine.
+
+Privacy contract (hard):
+  - The report never contains prompts, file paths, or user identifiers.
+  - Projects unrelated to this workspace are aggregated anonymously as "other";
+    only --all-projects (explicit, still local-only) names them.
+  - Output lands under runs/ (gitignored); never commit it.
+
+Out of scope (see the token-usage-analysis skill / issue #32): team or cross-machine
+aggregation, billing reconciliation, USD cost math (use ccusage as an optional
+cross-check), deep rework analysis.
+
+Exit codes: 0 report written; 2 no local session data found at all (vacuous-green law:
+"no data" must not look like a quiet success).
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+
+if sys.version_info < (3, 9):
+    _name = os.path.basename(__file__)
+    sys.stderr.write("FAIL: %s needs Python 3.9 or newer; this is Python %s (%s). Run it with a newer python3 "
+                     "(on macOS: /usr/bin/python3 scripts/%s ...).\n" % (_name, sys.version.split()[0],
+                                                                         sys.executable, _name))
+    sys.exit(2)
+# Other scripts and tests load this file as a module, so its own folder may not be on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.mounts import registered_repos  # noqa: E402
+
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+_FRACTION = re.compile(r"(T\d\d:\d\d:\d\d)\.(\d+)")
+_OFFSET = re.compile(r"(T[\d:.]+[+-]\d\d)(\d\d)$")
+
+
+def from_iso(ts):
+    """datetime.fromisoformat that reads, on Python 3.9/3.10 too, what 3.11+ reads: a trailing Z, an
+    offset without a colon (+0800), and fractional seconds of any length (3.9/3.10 take only 3 or 6
+    digits). Raises ValueError."""
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    ts = _FRACTION.sub(lambda m: "%s.%s" % (m.group(1), (m.group(2) + "000000")[:6]), ts, count=1)
+    ts = _OFFSET.sub(r"\1:\2", ts, count=1)
+    return datetime.fromisoformat(ts)
+
+
+def parse_iso(ts):
+    """ISO-8601 (with Z) -> aware datetime in local time, or None."""
+    if not ts:
+        return None
+    try:
+        return from_iso(ts).astimezone()
+    except ValueError:
+        return None
+
+
+def workspace_repo_ids(root):
+    """Hand-parse repositories[].id (same spirit as check-permissions) from workspace.yaml and
+    the gitignored workspace.local.yaml sidecar — on main the tracked key is a frozen [] and
+    scripts/setup-repos registers the real mounts in the sidecar. Union, first-seen order."""
+    ids = []
+    for name in ("workspace.yaml", "workspace.local.yaml"):
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        in_block = False
+        for line in lines:
+            if re.match(r"^repositories\s*:", line):
+                in_block = True
+                continue
+            if in_block:
+                if re.match(r"^[A-Za-z_]", line):
+                    break
+                m = re.match(r"^\s*-\s*id:\s*([^\s#]+)", line)
+                if m and m.group(1) not in ids:
+                    ids.append(m.group(1))
+    return ids
+
+
+def bucket_for_cwd(cwd, root, repo_ids, all_projects, repo_paths=None):
+    """Map a session cwd to a reporting bucket. Returns (bucket, inferred).
+
+    Under <root>/repos/<id> -> the repo id; elsewhere under <root> -> "workspace";
+    a known repo id in a temp/worktree checkout path -> that id, marked inferred;
+    anything else -> the anonymous "other" bucket (unless --all-projects).
+    """
+    if not cwd:
+        return "other", False
+    c = cwd.rstrip("/")
+    r = (root or "").rstrip("/")
+    for rid, path in (repo_paths or {}).items():
+        mounted = os.path.abspath(path).rstrip("/")
+        if c == mounted or c.startswith(mounted + "/"):
+            return rid, False
+    if r and (c == r or c.startswith(r + "/")):
+        rel = c[len(r):].lstrip("/")
+        parts = rel.split("/") if rel else []
+        if len(parts) >= 2 and parts[0] == "repos":
+            return parts[1], False
+        return "workspace", False
+    for rid in repo_ids:
+        if ("/repos/%s/" % rid) in (c + "/"):
+            return rid, True
+    if all_projects:
+        return c, False
+    return "other", False
+
+
+def collect_claude(claude_dir, since, until, root, repo_ids, all_projects):
+    """Aggregate Claude Code per-message usage. Returns (stats, files_seen) or (None, 0)."""
+    if not os.path.isdir(claude_dir):
+        return None, 0
+    totals = defaultdict(int)
+    by_bucket = defaultdict(lambda: defaultdict(int))
+    bucket_sessions = defaultdict(set)
+    bucket_inferred = set()
+    by_model = defaultdict(lambda: defaultdict(int))
+    by_day = defaultdict(lambda: defaultdict(int))
+    by_hour = defaultdict(int)
+    by_branch = defaultdict(int)
+    cells = defaultdict(lambda: defaultdict(int))  # (day, bucket, model) -> usage
+    sessions = {}
+    sidechain = defaultdict(int)
+    best = {}  # (requestId, message.id) -> record with the LARGEST output copy
+    files_seen = 0
+    repo_paths = registered_repos(root)
+    since_epoch = datetime.combine(since, datetime.min.time()).timestamp()
+    for proj in sorted(os.listdir(claude_dir)):
+        pdir = os.path.join(claude_dir, proj)
+        if not os.path.isdir(pdir):
+            continue
+        # Recurse: subagent transcripts live under <session>/subagents/*.jsonl,
+        # not beside the session files — a flat listdir silently drops their usage.
+        paths = []
+        for dirpath, _dirnames, filenames in os.walk(pdir):
+            for name in filenames:
+                if name.endswith(".jsonl"):
+                    paths.append(os.path.join(dirpath, name))
+        for path in sorted(paths):
+            files_seen += 1
+            try:
+                if os.stat(path).st_mtime < since_epoch:
+                    continue  # untouched since window start -> all entries older
+            except OSError:
+                continue
+            try:
+                fh = open(path, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if o.get("type") != "assistant":
+                        continue
+                    msg = o.get("message") or {}
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    ts = parse_iso(o.get("timestamp"))
+                    if ts is None:
+                        continue
+                    day = ts.date()
+                    if day < since or day > until:
+                        continue
+                    # Dedup with keep-max: streamed writes repeat an entry with the same
+                    # (requestId, message.id) while output grows across copies — input and
+                    # cache fields are fixed at request start. Keeping the first copy
+                    # undercounts output; keep the copy with the largest output instead.
+                    key = (o.get("requestId") or o.get("uuid"), msg.get("id") or "")
+                    out = usage.get("output_tokens") or 0
+                    cur = best.get(key)
+                    if cur is not None and cur["out"] >= out:
+                        continue
+                    best[key] = {
+                        "ts": ts, "day": day,
+                        "inp": usage.get("input_tokens") or 0, "out": out,
+                        "cr": usage.get("cache_read_input_tokens") or 0,
+                        "cc": usage.get("cache_creation_input_tokens") or 0,
+                        "think": (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
+                        "cwd": o.get("cwd"), "sid": o.get("sessionId"),
+                        "model": msg.get("model") or "unknown",
+                        "branch": o.get("gitBranch"), "side": bool(o.get("isSidechain")),
+                    }
+    for rec in best.values():
+        ts, day = rec["ts"], rec["day"]
+        inp, out, cr, cc = rec["inp"], rec["out"], rec["cr"], rec["cc"]
+        bucket, inferred = bucket_for_cwd(rec["cwd"], root, repo_ids, all_projects, repo_paths)
+        if inferred:
+            bucket_inferred.add(bucket)
+        totals["messages"] += 1
+        totals["input"] += inp
+        totals["output"] += out
+        totals["cache_read"] += cr
+        totals["cache_creation"] += cc
+        totals["thinking"] += rec["think"]
+        b = by_bucket[bucket]
+        b["messages"] += 1
+        b["input"] += inp
+        b["output"] += out
+        b["cache_read"] += cr
+        b["cache_creation"] += cc
+        sid = rec["sid"]
+        if sid:
+            bucket_sessions[bucket].add(sid)
+            lo, hi = sessions.get(sid, (ts, ts))
+            sessions[sid] = (min(lo, ts), max(hi, ts))
+        m = by_model[rec["model"]]
+        m["messages"] += 1
+        m["input"] += inp
+        m["output"] += out
+        d = by_day[day.isoformat()]
+        d["messages"] += 1
+        d["input"] += inp
+        d["output"] += out
+        d["cache_read"] += cr
+        d["cache_creation"] += cc
+        by_hour[ts.hour] += 1
+        cell = cells[(day.isoformat(), bucket, rec["model"])]
+        cell["messages"] += 1
+        cell["input"] += inp
+        cell["output"] += out
+        cell["cache_read"] += cr
+        cell["cache_creation"] += cc
+        if rec["branch"] and bucket != "other":
+            by_branch["%s @ %s" % (bucket, rec["branch"])] += out
+        if rec["side"]:
+            sidechain["messages"] += 1
+            sidechain["output"] += out
+    durations = sorted(
+        (hi - lo).total_seconds() / 60 for lo, hi in sessions.values() if hi > lo
+    )
+    if not best:
+        return None, files_seen
+    stats = {
+        "totals": dict(totals),
+        "by_bucket": {
+            k: dict(v, sessions=len(bucket_sessions[k]), inferred=(k in bucket_inferred))
+            for k, v in by_bucket.items()
+        },
+        "by_model": {k: dict(v) for k, v in by_model.items()},
+        "by_day": {k: dict(v) for k, v in sorted(by_day.items())},
+        "by_hour": {str(h): by_hour[h] for h in sorted(by_hour)},
+        "sessions": {
+            "count": len(sessions),
+            "median_minutes": round(durations[len(durations) // 2], 1) if durations else 0,
+        },
+        "sidechain": dict(sidechain),
+        # Additive day x bucket x model cells: lets a consumer (ai-usage-weekly) attribute an
+        # estimated cost exactly per day / per repo without re-reading the sessions.
+        "cells": [dict(day=k[0], bucket=k[1], model=k[2], **v) for k, v in sorted(cells.items())],
+    }
+    stats["by_branch"] = dict(
+        sorted(by_branch.items(), key=lambda kv: -kv[1])[:10]
+    )
+    return stats, files_seen
+
+
+def collect_codex(codex_dir, since, until, root, repo_ids, all_projects):
+    """Sum counter increments at each token_count event's local date, including resumed sessions.
+    Read the pre-window baseline too; repeated counters add nothing and a counter reset starts a
+    new epoch. Session counts are per-window active sessions, not additive across weeks."""
+    if not os.path.isdir(codex_dir):
+        return None, 0
+    totals = defaultdict(int)
+    by_bucket = defaultdict(lambda: defaultdict(int))
+    bucket_inferred = set()
+    files_seen = 0
+    repo_paths = registered_repos(root)
+    with_usage = 0
+    for dirpath, _dirnames, filenames in os.walk(codex_dir):
+        for name in sorted(filenames):
+            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                continue
+            files_seen += 1
+            cwd = None
+            meta_day = None
+            previous = None
+            window_usage = defaultdict(int)
+            active = False
+            fields = (("input_tokens", "input"), ("cached_input_tokens", "cached_input"),
+                      ("output_tokens", "output"), ("reasoning_output_tokens", "reasoning"))
+            try:
+                fh = open(os.path.join(dirpath, name), encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    t = o.get("type")
+                    p = o.get("payload") or {}
+                    if t == "session_meta":
+                        cwd = p.get("cwd")
+                        ts = parse_iso(p.get("timestamp") or o.get("timestamp"))
+                        meta_day = ts.date() if ts else None
+                    elif t == "event_msg" and p.get("type") == "token_count":
+                        info = p.get("info")
+                        usage = (info or {}).get("total_token_usage")
+                        if not isinstance(usage, dict):
+                            continue
+                        current = {dst: usage.get(src) or 0 for src, dst in fields}
+                        if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in current.values()):
+                            continue
+                        reset = previous is not None and current["input"] + current["output"] < previous["input"] + previous["output"]
+                        baseline = {} if previous is None or reset else previous
+                        delta = {k: max(0, v - baseline.get(k, 0)) for k, v in current.items()}
+                        changed = previous is None or current != previous
+                        previous = current  # even an undated/out-of-window event sets the next baseline
+                        ts = parse_iso(o.get("timestamp"))
+                        if ts is not None and since <= ts.date() <= until and changed:
+                            active = True
+                            for k, v in delta.items():
+                                window_usage[k] += v
+            # Keep legacy visibility for a session with no counters at all. A session with counters
+            # is included only where a dated counter changed, never by its filename/start date.
+            if not active and not (previous is None and meta_day is not None and since <= meta_day <= until):
+                continue
+            bucket, inferred = bucket_for_cwd(cwd, root, repo_ids, all_projects, repo_paths)
+            if inferred:
+                bucket_inferred.add(bucket)
+            totals["sessions"] += 1
+            by_bucket[bucket]["sessions"] += 1
+            if active:
+                with_usage += 1
+                for k, v in window_usage.items():
+                    totals[k] += v
+                    by_bucket[bucket][k] += v
+    if not totals.get("sessions"):
+        return None, files_seen
+    stats = {
+        "totals": dict(totals),
+        "sessions_with_usage": with_usage,
+        "by_bucket": {
+            k: dict(v, inferred=(k in bucket_inferred)) for k, v in by_bucket.items()
+        },
+    }
+    return stats, files_seen
+
+
+def qoder_credits(usage):
+    """The credits of one Qoder usage record, or None. Qoder logs credits, not tokens (its token fields are 0)."""
+    v = (usage or {}).get("credits") if isinstance(usage, dict) else None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+        return None
+    return float(v)
+
+
+def collect_qoder(qoder_dir, since, until, root, repo_ids, all_projects):
+    """Aggregate Qoder per-message credits. The log has the Claude Code shape, but each message is
+    written several times and only the last copy has usage; keep one copy per message id.
+    Credits are never converted to tokens. Returns (stats, files_seen) or (None, 0)."""
+    if not os.path.isdir(qoder_dir):
+        return None, 0
+    best = {}
+    files_seen = 0
+    repo_paths = registered_repos(root)
+    since_epoch = datetime.combine(since, datetime.min.time()).timestamp()
+    for dirpath, _dirnames, filenames in os.walk(qoder_dir):
+        for name in sorted(filenames):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(dirpath, name)
+            files_seen += 1
+            try:
+                if os.stat(path).st_mtime < since_epoch:
+                    continue
+                fh = open(path, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(o, dict) or o.get("type") != "assistant":
+                        continue
+                    msg = o.get("message") if isinstance(o.get("message"), dict) else {}
+                    usage = msg.get("usage")
+                    credits = qoder_credits(usage)
+                    if credits is None:
+                        continue
+                    ts = o.get("timestamp")
+                    ts = parse_iso(ts) if isinstance(ts, str) else None
+                    if ts is None:
+                        continue
+                    day = ts.date()
+                    if day < since or day > until:
+                        continue
+                    key = msg.get("id") or usage.get("request_id") or o.get("uuid")
+                    best[key or (path, len(best))] = {"day": day.isoformat(), "credits": credits,
+                                                      "cwd": o.get("cwd"), "sid": o.get("sessionId")}
+    if not best:
+        return None, files_seen
+    totals = {"messages": 0, "credits": 0.0}
+    by_day = defaultdict(lambda: {"messages": 0, "credits": 0.0})
+    by_bucket = defaultdict(lambda: {"messages": 0, "credits": 0.0})
+    bucket_sessions = defaultdict(set)
+    bucket_inferred = set()
+    sessions = set()
+    for rec in best.values():
+        bucket, inferred = bucket_for_cwd(rec["cwd"], root, repo_ids, all_projects, repo_paths)
+        if inferred:
+            bucket_inferred.add(bucket)
+        for tgt in (totals, by_day[rec["day"]], by_bucket[bucket]):
+            tgt["messages"] += 1
+            tgt["credits"] += rec["credits"]
+        if rec["sid"]:
+            sessions.add(rec["sid"])
+            bucket_sessions[bucket].add(rec["sid"])
+    return {
+        "totals": totals,
+        "sessions": len(sessions),
+        "by_day": {k: v for k, v in sorted(by_day.items())},
+        "by_bucket": {k: dict(v, sessions=len(bucket_sessions[k]), inferred=(k in bucket_inferred))
+                      for k, v in by_bucket.items()},
+    }, files_seen
+
+
+# ccusage major versions this adapter was evaluated against (see the skill's
+# tool-selection ADR). An installed ccusage outside this range is treated as
+# unavailable rather than trusted blindly.
+CCUSAGE_EVALUATED_MAJORS = {20}
+
+
+class CcusageSchemaError(ValueError):
+    """The installed adapter returned data outside the evaluated v20 contract."""
+
+
+def ccusage_number(record, field, context, integer=False):
+    """Read one non-negative finite number without coercing strings or booleans."""
+    value = record.get(field, 0)
+    if value is None:
+        value = 0
+    valid_type = isinstance(value, int) if integer else isinstance(value, (int, float))
+    if isinstance(value, bool) or not valid_type or not math.isfinite(value) or value < 0:
+        raise CcusageSchemaError("%s.%s must be a non-negative %s" % (
+            context, field, "integer" if integer else "number"))
+    return value
+
+
+def find_ccusage_cmd():
+    """Locate an OPERATOR-INSTALLED ccusage binary of an evaluated major version.
+
+    Returns (argv_prefix, note). Never auto-downloads: an implicit `npx ccusage@latest`
+    would silently fetch and execute an unpinned third-party package against local
+    session data — installation is the operator's explicit opt-in, not this script's.
+    """
+    from shutil import which
+    if not which("ccusage"):
+        return None, "ccusage 未安装(安装是操作者的显式动作,本脚本不代下载)"
+    try:
+        r = subprocess.run(["ccusage", "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None, "ccusage --version 执行失败"
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", r.stdout + r.stderr)
+    if not m:
+        return None, "ccusage 版本无法识别"
+    if int(m.group(1)) not in CCUSAGE_EVALUATED_MAJORS:
+        return None, "ccusage v%s 不在已评测版本范围(v%s)内,按未评测处理" % (
+            m.group(0), "/".join(str(v) for v in sorted(CCUSAGE_EVALUATED_MAJORS)))
+    return ["ccusage"], "ccusage v%s" % m.group(0)
+
+
+def collect_ccusage(since, until, inject_path=None):
+    """Base usage from the external standard-JSON tool (ccusage daily --json).
+
+    Returns normalized aggregates {days, models, agents, totals} — token totals plus
+    estimated USD cost — or None on any failure (absent tool, timeout, unexpected JSON):
+    the caller falls back to the native collector. The raw external JSON is never written
+    into the report; only these normalized aggregates are (privacy contract unchanged).
+    """
+    if inject_path:
+        try:
+            with open(inject_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except OSError:
+            collect_ccusage.last_note = "ccusage JSON 文件不可读"
+            return None
+        except ValueError:
+            collect_ccusage.last_note = "ccusage JSON 无法解析"
+            return None
+    else:
+        cmd, note = find_ccusage_cmd()
+        if not cmd:
+            collect_ccusage.last_note = note
+            return None
+        collect_ccusage.last_note = note
+        try:
+            r = subprocess.run(
+                cmd + ["daily", "--json", "--by-agent",
+                       "--since", since.strftime("%Y%m%d"),
+                       "--until", until.strftime("%Y%m%d")],
+                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            collect_ccusage.last_note = "ccusage daily 超时(120 秒)"
+            return None
+        except (OSError, subprocess.SubprocessError):
+            collect_ccusage.last_note = "ccusage daily 执行失败"
+            return None
+        if r.returncode != 0:
+            collect_ccusage.last_note = "ccusage daily 退出码 %d" % r.returncode
+            return None
+        try:
+            raw = json.loads(r.stdout)
+        except ValueError:
+            collect_ccusage.last_note = "ccusage daily 输出不是合法 JSON"
+            return None
+    rows = raw.get("daily") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        collect_ccusage.last_note = "ccusage JSON 缺少 daily 数组"
+        return None
+    tok_map = (("inputTokens", "input"), ("outputTokens", "output"),
+               ("cacheReadTokens", "cache_read"), ("cacheCreationTokens", "cache_creation"))
+    # The primary sections use only the CORRELATABLE set — the agents the native
+    # attribution layer also covers. Other CLIs' usage is real but cannot be linked to
+    # repos/tasks, so it goes to a separate "unattributed" appendix, never mixed in.
+    correlatable = {"claude", "codex"}
+    days, models, agents = {}, {}, {}
+    tot = defaultdict(float)
+    correlatable_seen = False
+    try:
+        for row_index, row in enumerate(rows):
+            context = "daily[%d]" % row_index
+            if not isinstance(row, dict):
+                raise CcusageSchemaError("%s must be an object" % context)
+            day = row.get("period")
+            if not isinstance(day, str):
+                raise CcusageSchemaError("%s.period must be YYYY-MM-DD" % context)
+            try:
+                parsed_day = datetime.strptime(day, "%Y-%m-%d").date()
+            except ValueError:
+                raise CcusageSchemaError("%s.period must be YYYY-MM-DD" % context)
+            if not (since <= parsed_day <= until):
+                continue
+            raw_agents = row.get("agents")
+            if not isinstance(raw_agents, list):
+                raise CcusageSchemaError("%s.agents must be an array" % context)
+            day_totals = defaultdict(float)
+            row_correlatable = False
+            for agent_index, a in enumerate(raw_agents):
+                agent_context = "%s.agents[%d]" % (context, agent_index)
+                if not isinstance(a, dict):
+                    raise CcusageSchemaError("%s must be an object" % agent_context)
+                name = a.get("agent") or "unknown"
+                if not isinstance(name, str):
+                    raise CcusageSchemaError("%s.agent must be a string" % agent_context)
+                raw_mbs = a.get("modelBreakdowns") or []
+                if not isinstance(raw_mbs, list):
+                    raise CcusageSchemaError(
+                        "%s.modelBreakdowns must be an array" % agent_context)
+                mbs = []
+                for model_index, model in enumerate(raw_mbs):
+                    model_context = "%s.modelBreakdowns[%d]" % (agent_context, model_index)
+                    if not isinstance(model, dict):
+                        raise CcusageSchemaError("%s must be an object" % model_context)
+                    model_name = model.get("modelName") or "unknown"
+                    if not isinstance(model_name, str):
+                        raise CcusageSchemaError(
+                            "%s.modelName must be a string" % model_context)
+                    mbs.append({
+                        "modelName": model_name,
+                        "input": ccusage_number(model, "inputTokens", model_context, True),
+                        "output": ccusage_number(model, "outputTokens", model_context, True),
+                        "cost": ccusage_number(model, "cost", model_context),
+                    })
+                values = {dst: ccusage_number(a, src, agent_context, True)
+                          for src, dst in tok_map}
+                if "totalCost" in a and a.get("totalCost") is not None:
+                    a_cost = ccusage_number(a, "totalCost", agent_context)
+                else:
+                    a_cost = sum(model["cost"] for model in mbs)
+                ag = agents.setdefault(name, defaultdict(float))
+                for dst, value in values.items():
+                    ag[dst] += value
+                ag["cost"] += a_cost
+                if name not in correlatable:
+                    continue
+                correlatable_seen = True
+                row_correlatable = True
+                for dst, value in values.items():
+                    day_totals[dst] += value
+                    tot[dst] += value
+                day_totals["cost"] += a_cost
+                tot["cost"] += a_cost
+                for model in mbs:
+                    mm = models.setdefault(model["modelName"], defaultdict(float))
+                    mm["input"] += model["input"]
+                    mm["output"] += model["output"]
+                    mm["cost"] += model["cost"]
+            if row_correlatable:
+                d = days.setdefault(day, defaultdict(float))
+                for key, value in day_totals.items():
+                    d[key] += value
+    except CcusageSchemaError as exc:
+        collect_ccusage.last_note = "ccusage JSON schema invalid:%s" % exc
+        return None
+    if not correlatable_seen or not days:
+        collect_ccusage.last_note = "ccusage 输出没有 claude/codex 分源数据"
+        return None
+    def fin(d):
+        return {k: (round(v, 2) if k == "cost" else int(v)) for k, v in d.items()}
+    return {"days": {k: fin(v) for k, v in sorted(days.items())},
+            "models": {k: fin(v) for k, v in models.items()},
+            "agents": {k: fin(v) for k, v in agents.items()},
+            "others": {k: fin(v) for k, v in agents.items() if k not in correlatable},
+            "totals": fin(tot)}
+
+
+def reconcile(claude, codex, ext):
+    """Cross-check native vs external on their overlapping scopes.
+
+    Claude compares all four token fields; Codex compares output only — ccusage splits
+    cached tokens out of input while the native Codex counter is gross, so input is not
+    comparable across the two (see metrics-guide).
+    """
+    rows = []
+    if claude and ext and "claude" in ext.get("agents", {}):
+        c, nt = ext["agents"]["claude"], claude["totals"]
+        for f in ("input", "output", "cache_read", "cache_creation"):
+            nv, cv = int(nt.get(f, 0) or 0), int(c.get(f, 0) or 0)
+            m = max(nv, cv)
+            rows.append({"scope": "claude", "field": f, "native": nv, "external": cv,
+                         "diff_pct": round(abs(nv - cv) / m * 100, 2) if m else 0.0})
+    if codex and ext and "codex" in ext.get("agents", {}):
+        x, xt = ext["agents"]["codex"], codex["totals"]
+        nv, cv = int(xt.get("output", 0) or 0), int(x.get("output", 0) or 0)
+        m = max(nv, cv)
+        rows.append({"scope": "codex", "field": "output", "native": nv, "external": cv,
+                     "diff_pct": round(abs(nv - cv) / m * 100, 2) if m else 0.0})
+    return rows
+
+
+def git_stats(path, since, until):
+    """Commit count + line churn for one repo in the window, or None."""
+    if not os.path.isdir(path):
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", path, "log",
+             "--since", since.isoformat() + " 00:00:00",
+             "--until", until.isoformat() + " 23:59:59",
+             "--pretty=%H", "--shortstat"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    commits = ins = dels = 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if HEX40.match(line):
+            commits += 1
+        else:
+            m = re.search(r"(\d+) insertion", line)
+            if m:
+                ins += int(m.group(1))
+            m = re.search(r"(\d+) deletion", line)
+            if m:
+                dels += int(m.group(1))
+    return {"commits": commits, "insertions": ins, "deletions": dels}
+
+
+def fmt(n):
+    return format(int(n), ",")
+
+
+def pct(part, whole):
+    return "%.1f%%" % (100.0 * part / whole) if whole else "-"
+
+
+def markdown_to_html(md_text, title):
+    """Minimal renderer for OUR OWN report markdown subset (h1/h2, tables, blockquotes,
+    indented code, **bold**, `code`). Self-contained HTML, no external assets — the file
+    stays local under runs/ exactly like the markdown it mirrors."""
+    import html as _h
+
+    def inline(s):
+        s = _h.escape(s, quote=False)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+        return s
+
+    out, table, quote, code = [], [], [], []
+
+    def flush():
+        if table:
+            out.append("<table><thead><tr>" +
+                       "".join("<th>%s</th>" % c for c in table[0]) + "</tr></thead><tbody>")
+            for row in table[1:]:
+                out.append("<tr>" + "".join("<td>%s</td>" % c for c in row) + "</tr>")
+            out.append("</tbody></table>")
+            del table[:]
+        if quote:
+            out.append("<blockquote>%s</blockquote>" % "<br>".join(quote))
+            del quote[:]
+        if code:
+            out.append("<pre>%s</pre>" % _h.escape("\n".join(code), quote=False))
+            del code[:]
+
+    for line in md_text.splitlines():
+        if line.startswith("| "):
+            if re.match(r"^\|[-| ]+\|$", line.replace("---", "-")):
+                continue
+            table.append([inline(c.strip()) for c in line.strip("|").split(" | ")])
+            continue
+        if line.startswith("> "):
+            flush() if table or code else None
+            quote.append(inline(line[2:]))
+            continue
+        if line.startswith("    ") and line.strip():
+            flush() if table or quote else None
+            code.append(line[4:])
+            continue
+        flush()
+        if line.startswith("## "):
+            out.append("<h2>%s</h2>" % inline(line[3:]))
+        elif line.startswith("# "):
+            out.append("<h1>%s</h1>" % inline(line[2:]))
+        elif line.strip():
+            out.append("<p>%s</p>" % inline(line))
+    flush()
+    return ("<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>%s</title><style>"
+            "body{font:15px/1.6 -apple-system,'PingFang SC',sans-serif;color:#1f2430;"
+            "background:#fafafa;max-width:1080px;margin:2rem auto;padding:0 1.2rem}"
+            "h1{font-size:1.5rem}h2{font-size:1.15rem;margin-top:2rem;border-bottom:1px solid #ddd;"
+            "padding-bottom:.3rem}table{border-collapse:collapse;margin:.8rem 0;display:block;"
+            "overflow-x:auto;max-width:100%%}th,td{border:1px solid #d8dce3;padding:.35rem .6rem;"
+            "text-align:left;white-space:nowrap}th{background:#eef1f5}tr:nth-child(even) td{"
+            "background:#f5f7fa}blockquote{border-left:4px solid #c6cbd4;background:#f0f2f5;"
+            "margin:.8rem 0;padding:.5rem .9rem;color:#4a5160}pre{background:#282c34;color:#e6e6e6;"
+            "padding:.7rem 1rem;border-radius:6px;overflow-x:auto}code{background:#eceff3;"
+            "padding:.05rem .3rem;border-radius:3px}</style></head><body>%s</body></html>"
+            ) % (_h.escape(title), "\n".join(out))
+
+
+def write_html_sibling(md_path, title):
+    """Render <report>.html beside <report>.md; returns the html path."""
+    with open(md_path, encoding="utf-8") as fh:
+        html_text = markdown_to_html(fh.read(), title)
+    html_path = md_path[:-3] + ".html"
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html_text)
+    return html_path
+
+
+def open_local(path):
+    """Best-effort open in the operator's default viewer (local file, no network)."""
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        subprocess.run([opener, path], check=False, timeout=15)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def render_markdown(meta, claude, codex, git, ext=None, recon=None, qoder=None):
+    L = []
+    L.append("# 本地 Token 使用报告(%s ~ %s)" % (meta["since"], meta["until"]))
+    L.append("")
+    L.append("生成时间:%s。数据源:Claude Code(%s)/ Codex(%s)/ Qoder(%s)。" % (
+        meta["generated_at"],
+        "%d 个 session 文件" % meta["claude_files"] if meta["claude_files"] else "未发现",
+        "%d 个 session 文件" % meta["codex_files"] if meta["codex_files"] else "未发现",
+        "%d 个 session 文件" % meta.get("qoder_files", 0) if meta.get("qoder_files") else "未发现",
+    ))
+    L.append("")
+    L.append("基础用量来源:%s。归属/分支/使用模式/Git 关联各节始终来自原生采集器。" % meta["base_source"])
+    L.append("")
+    if meta["base_source"] == "native(fallback)":
+        L.append("> ℹ️ 本次未使用 ccusage(%s)。" % meta.get("ext_note", ""))
+        L.append("> **可选**:`npm i -g ccusage@20` 后重跑,可获得美元成本估算与双源对账。")
+        L.append("")
+    L.append("> 隐私:本报告不含 prompt、文件路径与用户标识;与本 workspace 无关的项目已匿名归并为")
+    L.append("> `other`。产物仅存本机 `runs/`(gitignored),请勿提交进 git 或外发;分享前先人工审查。")
+    L.append("")
+    L.append("## ① 消耗速度")
+    L.append("")
+    if ext or claude:
+        t = ext["totals"] if ext else claude["totals"]
+        ctx = t.get("input", 0) + t.get("cache_read", 0) + t.get("cache_creation", 0)
+        L.append("| 指标 | 值 |")
+        L.append("|---|---|")
+        if claude:
+            L.append("| Claude assistant 消息数 | %s |" % fmt(claude["totals"].get("messages", 0)))
+        L.append("| input tokens(非缓存) | %s |" % fmt(t.get("input", 0)))
+        L.append("| output tokens | %s |" % fmt(t.get("output", 0)))
+        L.append("| cache read | %s |" % fmt(t.get("cache_read", 0)))
+        L.append("| cache creation | %s |" % fmt(t.get("cache_creation", 0)))
+        L.append("| cache 命中率 | %s |" % pct(t.get("cache_read", 0), ctx))
+        if claude:
+            ct = claude["totals"]
+            L.append("| Claude thinking 占 output | %s |" %
+                     pct(ct.get("thinking", 0), ct.get("output", 0)))
+        if ext:
+            L.append("| 估算成本(可关联集 claude+codex,来自 ccusage) | $%.2f |" %
+                     ext["totals"].get("cost", 0))
+        L.append("")
+        if ext:
+            L.append("每日趋势(来源:ccusage,已过滤到可关联集 claude+codex;成本为估算 USD):")
+            L.append("")
+            L.append("| 日期 | input | output | cache read | 成本(USD) |")
+            L.append("|---|---|---|---|---|")
+            for day, d in ext["days"].items():
+                L.append("| %s | %s | %s | %s | %.2f |" % (
+                    day, fmt(d.get("input", 0)), fmt(d.get("output", 0)),
+                    fmt(d.get("cache_read", 0)), d.get("cost", 0)))
+        else:
+            L.append("每日趋势(消息数 / input / output / cache read):")
+            L.append("")
+            L.append("| 日期 | msgs | input | output | cache read |")
+            L.append("|---|---|---|---|---|")
+            for day, d in claude["by_day"].items():
+                L.append("| %s | %s | %s | %s | %s |" % (
+                    day, fmt(d["messages"]), fmt(d["input"]), fmt(d["output"]),
+                    fmt(d["cache_read"])))
+    elif codex:
+        t = codex["totals"]
+        L.append("| 指标 | 值 |")
+        L.append("|---|---|")
+        L.append("| Codex sessions | %s |" % fmt(t.get("sessions", 0)))
+        L.append("| input tokens(含 cached) | %s |" % fmt(t.get("input", 0)))
+        L.append("| cached input(上项子集) | %s |" % fmt(t.get("cached_input", 0)))
+        L.append("| output tokens | %s |" % fmt(t.get("output", 0)))
+        L.append("| reasoning output | %s |" % fmt(t.get("reasoning", 0)))
+        L.append("")
+        L.append("原生 Codex 数据只有 session 汇总,无每日趋势;安装已评测 ccusage 后可补齐。")
+    else:
+        L.append("无窗口内可用数据,本节不可用。")
+    L.append("")
+
+    L.append("## ② 任务热点(bucket × 分支)")
+    L.append("")
+    if claude:
+        L.append("| bucket | sessions | msgs | input | output | cache read |")
+        L.append("|---|---|---|---|---|---|")
+        for k, b in sorted(claude["by_bucket"].items(), key=lambda kv: -kv[1]["output"]):
+            label = k + (" `# inferred`" if b.get("inferred") else "")
+            L.append("| %s | %s | %s | %s | %s | %s |" % (
+                label, fmt(b["sessions"]), fmt(b["messages"]),
+                fmt(b["input"]), fmt(b["output"]), fmt(b["cache_read"])))
+        L.append("")
+        if claude["by_branch"]:
+            L.append("output tokens 最多的分支(top %d):" % len(claude["by_branch"]))
+            L.append("")
+            L.append("| bucket @ branch | output |")
+            L.append("|---|---|")
+            for k, v in claude["by_branch"].items():
+                L.append("| %s | %s |" % (k, fmt(v)))
+            L.append("")
+    else:
+        L.append("Claude 消息级数据缺席,无法做 workspace/分支归属,本节不可用。")
+        L.append("")
+
+    L.append("## ③ 模型选用")
+    L.append("")
+    if ext:
+        L.append("(来源:ccusage,已过滤到可关联集 claude+codex 的模型)")
+        L.append("")
+        L.append("| model | input | output | 成本(USD) |")
+        L.append("|---|---|---|---|")
+        for k, m in sorted(ext["models"].items(), key=lambda kv: -kv[1].get("output", 0)):
+            L.append("| %s | %s | %s | %.2f |" % (
+                k, fmt(m.get("input", 0)), fmt(m.get("output", 0)), m.get("cost", 0)))
+    elif claude:
+        L.append("| model | msgs | input | output |")
+        L.append("|---|---|---|---|")
+        for k, m in sorted(claude["by_model"].items(), key=lambda kv: -kv[1]["output"]):
+            L.append("| %s | %s | %s | %s |" %
+                     (k, fmt(m["messages"]), fmt(m["input"]), fmt(m["output"])))
+    else:
+        L.append("原生 Codex session 不含可靠模型分布,本节不可用;安装已评测 ccusage 后可补齐。")
+    L.append("")
+
+    L.append("## ④ 使用模式")
+    L.append("")
+    if claude:
+        t = claude["totals"]
+        L.append("session 数:%s;中位时长:%s 分钟;sidechain(子代理)消息占比:%s(output 占比 %s)。" % (
+            fmt(claude["sessions"]["count"]),
+            claude["sessions"]["median_minutes"],
+            pct(claude["sidechain"].get("messages", 0), t.get("messages", 0)),
+            pct(claude["sidechain"].get("output", 0), t.get("output", 0)),
+        ))
+        L.append("")
+        L.append("时段分布(本地时区,消息数):")
+        L.append("")
+        L.append("| 小时 | msgs |")
+        L.append("|---|---|")
+        for h, c in claude["by_hour"].items():
+            L.append("| %02d:00 | %s |" % (int(h), fmt(c)))
+        L.append("")
+    else:
+        L.append("Claude 消息级数据缺席,无法计算时段/session/sidechain 模式,本节不可用。")
+        L.append("")
+    L.append("## ⑤ Git 关联(基础版)")
+    L.append("")
+    if not claude:
+        L.append("Claude 消息级数据缺席,无法把 token 归属到 repo/branch 后关联 Git,本节不可用。")
+        L.append("")
+    elif git:
+        L.append("| bucket | commits | +lines | -lines | claude tokens(in+out) | tokens/commit |")
+        L.append("|---|---|---|---|---|---|")
+        for k, g in git.items():
+            b = (claude or {}).get("by_bucket", {}).get(k, {})
+            tok = b.get("input", 0) + b.get("output", 0)
+            per = fmt(tok // g["commits"]) if g["commits"] else "-"
+            L.append("| %s | %s | %s | %s | %s | %s |" % (
+                k, fmt(g["commits"]), fmt(g["insertions"]), fmt(g["deletions"]), fmt(tok), per))
+        L.append("")
+        L.append("口径与局限见 `skills/token-usage-analysis/references/metrics-guide.md`(粗指标,仅供趋势参考)。")
+        L.append("")
+    else:
+        L.append("窗口内未发现可关联的 Git 信号,本节无可报告记录。")
+        L.append("")
+    L.append("## ⑥ 对账(native × ccusage)")
+    L.append("")
+    if recon:
+        L.append("| 范围 | 字段 | native | ccusage | 差值 |")
+        L.append("|---|---|---|---|---|")
+        flagged = False
+        for r in recon:
+            flag = " ⚠" if r["diff_pct"] > 5 else ""
+            if r["diff_pct"] > 5:
+                flagged = True
+            L.append("| %s | %s | %s | %s | %.2f%%%s |" % (
+                r["scope"], r["field"], fmt(r["native"]), fmt(r["external"]), r["diff_pct"], flag))
+        L.append("")
+        if flagged:
+            L.append("⚠ 存在差值超过 5% 的字段——数据质量注意:请勿手工调数,先核对两侧口径与数据目录覆盖。")
+        else:
+            L.append("两侧重叠口径差值均 ≤5%,对账通过。")
+        L.append("")
+        L.append("(Codex 只对 output:ccusage 的 input 不含 cached,与原生毛口径不可比。)")
+    elif ext:
+        L.append("缺少可重叠的原生数据,无法与 ccusage 对账。")
+    else:
+        L.append("本次仅单一数据源可用,对账缺席(%s)。" % meta.get("ext_note", "外部源未启用"))
+    L.append("")
+    if codex:
+        ct = codex["totals"]
+        L.append("## Codex(粒度较粗,session 级)")
+        L.append("")
+        L.append("sessions:%s(其中 %s 个可解析 token 计数)。input %s / cached %s / output %s / reasoning %s。" % (
+            fmt(ct.get("sessions", 0)), fmt(codex.get("sessions_with_usage", 0)),
+            fmt(ct.get("input", 0)), fmt(ct.get("cached_input", 0)),
+            fmt(ct.get("output", 0)), fmt(ct.get("reasoning", 0))))
+        L.append("")
+        L.append("| bucket | sessions | input | output |")
+        L.append("|---|---|---|---|")
+        for k, b in sorted(codex["by_bucket"].items(), key=lambda kv: -kv[1].get("sessions", 0)):
+            label = k + (" `# inferred`" if b.get("inferred") else "")
+            L.append("| %s | %s | %s | %s |" % (
+                label, fmt(b.get("sessions", 0)), fmt(b.get("input", 0)), fmt(b.get("output", 0))))
+        L.append("")
+    if qoder:
+        qt = qoder["totals"]
+        L.append("## Qoder(积分,无 token)")
+        L.append("")
+        L.append("消息 %s · 会话 %s · 积分 %.2f。积分来自本机日志,未与账单核对;不换算为 token。" % (
+            fmt(qt["messages"]), fmt(qoder.get("sessions", 0)), qt["credits"]))
+        L.append("")
+        L.append("| bucket | 消息 | 积分 |")
+        L.append("|---|---|---|")
+        for k, b in sorted(qoder["by_bucket"].items(), key=lambda kv: -kv[1]["credits"]):
+            label = k + (" `# inferred`" if b.get("inferred") else "")
+            L.append("| %s | %s | %.2f |" % (label, fmt(b["messages"]), b["credits"]))
+        L.append("")
+    if ext and ext.get("others"):
+        L.append("## 附录:未归属用量(其他 CLI)")
+        L.append("")
+        L.append("以下 CLI 的用量真实存在,但无本地归属数据(无 cwd/分支/消息级),**不可与任务热点联动解释**;")
+        L.append("仅作总量参考(来源:ccusage)。")
+        L.append("")
+        L.append("| CLI | input | output | 成本(USD) |")
+        L.append("|---|---|---|---|")
+        for k, a in sorted(ext["others"].items(), key=lambda kv: -kv[1].get("output", 0)):
+            L.append("| %s | %s | %s | %.2f |" % (
+                k, fmt(a.get("input", 0)), fmt(a.get("output", 0)), a.get("cost", 0)))
+        L.append("")
+    return "\n".join(L) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Sanitized local token-usage report (see module docstring).")
+    ap.add_argument("--since", help="window start YYYY-MM-DD (default: 29 days ago)")
+    ap.add_argument("--until", help="window end YYYY-MM-DD, inclusive (default: today)")
+    ap.add_argument("--json", action="store_true", help="also write the aggregates as JSON")
+    ap.add_argument("--html", action="store_true",
+                    help="also render a local self-contained HTML beside the markdown")
+    ap.add_argument("--open", action="store_true",
+                    help="open the HTML in the default viewer (implies --html; local file only)")
+    ap.add_argument("--source", choices=["auto", "native", "ccusage"], default="auto",
+                    help="base-usage source: auto (default) prefers ccusage and falls back to "
+                         "native; correlation sections are always native")
+    ap.add_argument("--ccusage-json", metavar="PATH",
+                    help="read ccusage daily JSON from a file instead of invoking it (for tests)")
+    ap.add_argument("--all-projects", action="store_true",
+                    help="name non-workspace projects instead of the anonymous 'other' bucket (still local-only)")
+    ap.add_argument("--workspace-root", help="AI-Workspace root (default: this script's repo)")
+    ap.add_argument("--out", help="output dir (default: <root>/runs/token-usage)")
+    ap.add_argument("--claude-dir", default=os.path.expanduser("~/.claude/projects"),
+                    help="Claude Code projects dir (override for tests)")
+    ap.add_argument("--codex-dir", default=os.path.expanduser("~/.codex/sessions"),
+                    help="Codex sessions dir (override for tests)")
+    ap.add_argument("--qoder-dir", default=os.path.expanduser("~/.qoder/projects"),
+                    help="Qoder projects dir (override for tests)")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.workspace_root) if args.workspace_root else \
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    until = datetime.strptime(args.until, "%Y-%m-%d").date() if args.until else date.today()
+    since = datetime.strptime(args.since, "%Y-%m-%d").date() if args.since else until - timedelta(days=29)
+    if since > until:
+        print("FAIL: --since is after --until")
+        return 2
+    repo_ids = workspace_repo_ids(root)
+
+    claude, claude_files = collect_claude(args.claude_dir, since, until, root, repo_ids, args.all_projects)
+    codex, codex_files = collect_codex(args.codex_dir, since, until, root, repo_ids, args.all_projects)
+    qoder, qoder_files = collect_qoder(args.qoder_dir, since, until, root, repo_ids, args.all_projects)
+
+    ext = None
+    ext_note = "外部源未启用(--source native)"
+    if args.source in ("auto", "ccusage"):
+        collect_ccusage.last_note = ""
+        ext = collect_ccusage(since, until, args.ccusage_json)
+        if ext is None:
+            reason = getattr(collect_ccusage, "last_note", "") or "输出不可解析或为空"
+            if args.source == "ccusage":
+                # Explicitly requested external source: fail loudly, never fall back silently.
+                print("FAIL: --source ccusage 但外部源不可用:%s" % reason)
+                return 2
+            ext_note = "已回退 native:%s" % reason
+    if not claude and not codex and not qoder and not ext:
+        print("FAIL: no local session data in the requested window (checked %s, %s and %s) — nothing to report"
+              % (args.claude_dir, args.codex_dir, args.qoder_dir))
+        return 2
+    recon = reconcile(claude, codex, ext) if ext else None
+
+    git = {}
+    if os.path.isdir(root):
+        targets = {"workspace": root}
+        for rid in repo_ids:
+            targets[rid] = os.path.join(root, "repos", rid)
+        for k, path in targets.items():
+            g = git_stats(path, since, until)
+            if g and (g["commits"] or (claude or {}).get("by_bucket", {}).get(k)):
+                git[k] = g
+
+    meta = {
+        "since": since.isoformat(),
+        "until": until.isoformat(),
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "claude_files": claude_files,
+        "codex_files": codex_files,
+        "qoder_files": qoder_files,
+        "base_source": "ccusage" if ext else ("native" if args.source == "native" else "native(fallback)"),
+        "ext_note": ext_note,
+    }
+    out_dir = args.out or os.path.join(root, "runs", "token-usage")
+    os.makedirs(out_dir, exist_ok=True)
+    base = "usage-report-%s-%s" % (meta["since"], meta["until"])
+    md_path = os.path.join(out_dir, base + ".md")
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(render_markdown(meta, claude, codex, git, ext, recon, qoder))
+    if args.json:
+        with open(os.path.join(out_dir, base + ".json"), "w", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "claude": claude, "codex": codex, "qoder": qoder, "git": git,
+                       "external": ext, "reconciliation": recon},
+                      fh, ensure_ascii=False, indent=2)
+    if args.html or args.open:
+        html_path = write_html_sibling(md_path, "本地 Token 使用报告 %s~%s" % (meta["since"], meta["until"]))
+        print("OK: html written: %s" % html_path)
+        if args.open:
+            open_local(html_path)
+    t = (claude or {}).get("totals", {})
+    print("OK: usage report written: %s (base source %s; claude msgs %s, output %s; codex sessions %s; qoder msgs %s)" % (
+        md_path, meta["base_source"], fmt(t.get("messages", 0)), fmt(t.get("output", 0)),
+        fmt(((codex or {}).get("totals", {})).get("sessions", 0)),
+        fmt(((qoder or {}).get("totals", {})).get("messages", 0))))
+    if meta["base_source"] == "native(fallback)":
+        print("HINT: %s — 可选安装 `npm i -g ccusage@20` 获得成本估算与双源对账(本脚本不代安装)"
+              % ext_note)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

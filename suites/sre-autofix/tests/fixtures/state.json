@@ -1,0 +1,3 @@
+{"id": "INC-20260101-000000-deadbeef", "fingerprint": "deadbeefcafe0001", "rule_uid": "rule-example-5xx",
+ "subject": "example-api", "title": "example-api 5xx rate above threshold", "state": "ROOT_CAUSED",
+ "needs_human": false, "occurrences": 1, "degradations": [], "transitions": []}

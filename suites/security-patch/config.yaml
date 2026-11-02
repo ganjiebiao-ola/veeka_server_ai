@@ -1,0 +1,5 @@
+# suites/security-patch config. Copy to config.local.yaml (gitignored). The CLI reads only that file when it exists, so copy both keys.
+# tool_url is the backend API. ui_url is the browser UI.
+# run start launches the app tracked under suites/security-patch/app/.
+tool_url: "http://localhost:37018"
+ui_url: "http://localhost:32088"

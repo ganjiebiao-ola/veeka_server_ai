@@ -1,0 +1,6 @@
+{"results": {"A": {"status": 200, "frames": [
+ {"schema": {"refId": "A", "meta": {"preferredVisualisationType": "logs"}, "fields": [
+   {"name": "time", "type": "time"}, {"name": "message", "type": "string"}, {"name": "request_uri", "type": "string"},
+   {"name": "status", "type": "string"}, {"name": "__tag__:__hostname__", "type": "string"}]},
+  "data": {"values": [[1787902924000, 1787902923000], ["request_uri=\"/v1/orders\" status=\"500\"", "request_uri=\"/v1/orders\" status=\"200\""],
+                      ["/v1/orders", "/v1/orders"], ["500", "200"], ["app-host-003", "app-host-004"]]}}]}}}

@@ -1,0 +1,47 @@
+{
+ "summary": "FIXTURE-SUMMARY 本周用 AI 完成了 alpha 的探测重构。",
+ "projects": [
+  {
+   "name": "alpha",
+   "headline": "探测重构",
+   "status": [
+    "已提交"
+   ],
+   "value": "高",
+   "tasks": [
+    {
+     "title": "探测超时",
+     "detail": "5 秒 wait_for",
+     "evidence": "commit abc1234",
+     "ai_role": "起草+改写",
+     "deliverable": "PR #1",
+     "status": "已提交"
+    },
+    {
+     "title": "无证据任务",
+     "detail": "回归脚本改造,估计节省 2 小时"
+    }
+   ],
+   "risks": [
+    "线上未验证"
+   ]
+  }
+ ],
+ "reusable_methods": [
+  "先写单测再改"
+ ],
+ "failed_experiments": [],
+ "issues": [
+  "额度周四用尽"
+ ],
+ "next_actions": [
+  {
+   "priority": "high",
+   "item": "线上核对",
+   "acceptance": "三种场景通过"
+  }
+ ],
+ "resource_needs": [
+  "Codex 额度再加 20%"
+ ]
+}

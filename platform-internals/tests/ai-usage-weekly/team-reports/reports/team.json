@@ -1,0 +1,13 @@
+{
+ "team": "fixture-team",
+ "members": [
+  "alice",
+  "bob",
+  "carol"
+ ],
+ "timezone": "Asia/Singapore",
+ "business": "fixture-biz",
+ "platform_ids": {
+  "bob-platform": "bob"
+ }
+}

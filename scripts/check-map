@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Verify map artifacts under knowledge/maps/ — the smoke test for scripts/generate-map.
+
+Zero-dependency (stdlib only), a sibling of check-asset-metadata: same tiny frontmatter parser,
+same "zero coverage is a failure, not a pass" stance (a scan finding nothing to check must not
+read as green). Structural only — it does not require codebase-memory-mcp to be installed, or
+re-run indexing; it just validates what is already on disk.
+
+Two artifact kinds, per knowledge/maps/README.md's layout contract. This workspace is one
+project (mount-points.md, "Instance boundary"), so nothing carries a project segment:
+
+  knowledge/maps/overview.md         project map  (hand-authored; cross-repo, the superset)
+  knowledge/maps/<repo-id>/README.md code map     (generated; one repo's structure)
+
+Both need frontmatter + a body; only a code map (`status: generated`) additionally needs a
+provenance.json recording who generated it, when, and with which tool.
+
+argv[1] overrides the scan root — same convention as check-bundled-skills', for fixtures/tests.
+"""
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+REQUIRED_FIELDS = ("title", "category", "status", "last_reviewed")
+
+
+def parse_frontmatter(text):
+    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+    if not m:
+        return None, text
+    data = {}
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        mm = re.match(r"^([A-Za-z_][\w-]*):\s?(.*)$", line.rstrip())
+        if mm:
+            data[mm.group(1)] = mm.group(2).strip().strip("\"'")
+    return data, m.group(2)
+
+
+def check_provenance(map_dir, rel, status):
+    """A generated map must say who produced it, when, and with which tool.
+
+    Only `status: generated` maps are held to this: a hand-authored map (knowledge/maps/overview.md)
+    carries its provenance in its own frontmatter `source:` line and has no tool run to record.
+    """
+    if status != "generated":
+        return []
+    path = map_dir / "provenance.json"
+    if not path.exists():
+        return [f"{rel}: status is 'generated' but no provenance.json beside it "
+                f"(re-run scripts/generate-map, which writes it)"]
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        return [f"{rel}: provenance.json is unreadable ({exc})"]
+    last = (data.get("last") or {}).get("map-generated") if isinstance(data.get("last"), dict) else None
+    if not isinstance(last, dict):
+        return [f"{rel}: provenance.json has no last['map-generated'] record"]
+    missing = [k for k in ("at", "operator", "via", "tool", "mode", "repo_head") if not last.get(k)]
+    return [f"{rel}: provenance.json last['map-generated'] missing {', '.join(missing)}"] if missing else []
+
+
+def cbmignore_notes(map_dir, status):
+    """Non-fatal observations: an absent exclusion list is a quality smell, not a broken artifact.
+
+    Only generated maps have a repo being indexed; the hand-authored project map (overview.md)
+    has nothing to exclude.
+    """
+    if status != "generated" or (map_dir / ".cbmignore").exists():
+        return []
+    # Same guard as every other path rendered here: argv[1] can point outside the workspace
+    # (fixtures/tests), and relative_to raises rather than degrading.
+    where = map_dir.relative_to(root) if root in map_dir.parents else map_dir
+    return [f"{where}/.cbmignore is absent — the graph indexes everything "
+            f"git doesn't ignore; run the code-map-scope skill to cut generated noise"]
+
+
+def readiness_notes():
+    """Configuration presence is evidence, not proof of native MCP or subagent access."""
+    binary = shutil.which("codebase-memory-mcp")
+    notes = ["binary: installed" if binary else "binary: missing — run `ws map install`"]
+    clients = (("Claude Code", pathlib.Path.home() / ".claude.json"),
+               ("Codex", pathlib.Path.home() / ".codex" / "config.toml"))
+    for client, path in clients:
+        try:
+            if client == "Claude Code":
+                data = json.loads(path.read_text()) if path.exists() else {}
+                project = data.get("projects", {}).get(str(root), {})
+                entries = [data.get("mcpServers", {}), project.get("mcpServers", {})]
+                configured = any("codebase-memory-mcp" in servers for servers in entries if isinstance(servers, dict))
+                project_file = root / ".mcp.json"
+                if project_file.exists():
+                    configured |= "codebase-memory-mcp" in json.loads(project_file.read_text()).get("mcpServers", {})
+            else:
+                text = path.read_text()
+                configured = bool(re.search(r'^\s*\[mcp_servers\.(?:"codebase-memory-mcp"|codebase-memory-mcp)\]\s*(?:#.*)?$', text, re.M))
+            state = "entry present, runtime unverified" if configured else "entry not found"
+        except FileNotFoundError:
+            state = "configuration not found"
+        except (OSError, ValueError, TypeError, AttributeError):
+            state = "configuration unreadable, registration unverified"
+        notes.append(f"{client}: {state}")
+    notes.append("native access, subagent access, and query success: unverified — run search_graph and check_index_coverage in the actual session")
+    notes.append("Read augmentation: unverified and separate from direct graph access")
+    return notes
+
+
+def tool_notes():
+    """Warn (never fail) when the installed codebase-memory-mcp is not the version the workspace pins.
+
+    A pin bump arrives with `git pull`, but the binary doesn't move by itself — and a map generated
+    by an older build would quietly undo the upgrade. The pin lives only in scripts/setup-map-tool,
+    so it is read from there. Not installed at all is fine: this check stays structural.
+    """
+    found = shutil.which("codebase-memory-mcp")
+    m = re.search(r'^PINNED_VERSION = "v?([^"]+)"', (root / "scripts" / "setup-map-tool").read_text(), re.M)
+    if not found or not m:
+        return []
+    try:
+        version = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        version = ""
+    if version.split()[-1:] == [m.group(1)]:
+        return []
+    return [f"codebase-memory-mcp is {version.split()[-1] if version else 'an unknown version'}, workspace pins v{m.group(1)} — "
+            f"run `ws map install`, then restart agent sessions"]
+
+
+def main(argv):
+    base = pathlib.Path(argv[0]).resolve() if argv else root / "knowledge" / "maps"
+    if not base.is_dir():
+        print(f"FAIL: map artifacts")
+        print(f"  - base dir does not exist: {base}")
+        return 1
+
+    project_maps = sorted(base.glob("overview.md"))
+    code_maps = sorted(base.glob("*/README.md"))
+    map_files = project_maps + code_maps
+    if not map_files:
+        print("FAIL: map artifacts")
+        print(f"  - no map README.md found under {base} — zero coverage is not a pass.")
+        print("    Expected knowledge/maps/overview.md and/or knowledge/maps/<id>/README.md —")
+        print("    run scripts/generate-map <id>|--all first (after scripts/setup-map-tool).")
+        return 1
+
+    errors = []
+    notes = []
+    checked = 0
+    for f in map_files:
+        rel = f.relative_to(root) if root in f.parents else f
+        data, rest = parse_frontmatter(f.read_text())
+        if data is None:
+            errors.append(f"{rel}: no YAML frontmatter")
+            continue
+        for field in REQUIRED_FIELDS:
+            if not data.get(field):
+                errors.append(f"{rel}: missing/empty required field '{field}'")
+        if not rest.strip():
+            errors.append(f"{rel}: empty body (frontmatter only)")
+        errors.extend(check_provenance(f.parent, rel, data.get("status", "")))
+        notes.extend(cbmignore_notes(f.parent, data.get("status", "")))
+        # Legacy maps may lack architecture.md. That is no action for the operator: agents use the
+        # live graph's get_architecture instead (agent-instructions/code-map.md). Check it when present.
+        for extra in ("architecture.md",):
+            if f not in code_maps:
+                continue
+            path = f.parent / extra
+            if not path.exists():
+                continue
+            checked += 1
+            e_data, e_rest = parse_frontmatter(path.read_text())
+            e_rel = path.relative_to(root) if root in path.parents else path
+            if e_data is None:
+                errors.append(f"{e_rel}: no YAML frontmatter")
+                continue
+            for field in REQUIRED_FIELDS:
+                if not e_data.get(field):
+                    errors.append(f"{e_rel}: missing/empty required field '{field}'")
+            if not e_rest.strip():
+                errors.append(f"{e_rel}: empty body (frontmatter only)")
+
+    if errors:
+        print("FAIL: map artifacts")
+        for e in errors:
+            print("  -", e)
+        return 1
+
+    where = base.relative_to(root) if root in base.parents or base == root else base
+    tool = [] if argv else tool_notes()  # fixture runs (argv[0]) check artifacts only
+    if tool:
+        # Exit 2 = WARN in ws health's vocabulary: reported, not a gate failure.
+        print("WARN: code-map tool version mismatch")
+        for n in tool:
+            print("  -", n)
+        for n in notes:
+            print("  NOTE:", n)
+        if not argv:
+            for n in readiness_notes():
+                print("  READINESS:", n)
+        return 2
+    print(f"OK: {len(project_maps)} project map(s) + {len(code_maps)} code map(s) "
+          f"(+{checked} companion doc(s)) under {where} — frontmatter, body and provenance present")
+    for n in notes:
+        print("  NOTE:", n)
+    if not argv:
+        for n in readiness_notes():
+            print("  READINESS:", n)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

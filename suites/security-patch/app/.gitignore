@@ -1,0 +1,18 @@
+node_modules
+.runtime/
+*.log
+.DS_Store
+backend/workspace/runs/
+backend/data/*.sqlite*
+.env
+.env.local
+dist/
+build/
+
+# UI screenshots — captured while debugging; may contain real repo content
+# / cost numbers / internal URLs. Don't commit. (Use Imgur / Slack for sharing.)
+/*.png
+
+!.env.example
+__pycache__/
+skill/ola-security-audit/targets/

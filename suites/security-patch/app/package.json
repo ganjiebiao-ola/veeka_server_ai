@@ -1,0 +1,9 @@
+{
+  "name": "security-patch-app-checks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test --parallel=4 --bail ./scanner ./scripts",
+    "check": "bun run --cwd backend check && bun run --cwd frontend typecheck"
+  }
+}

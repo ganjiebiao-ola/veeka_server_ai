@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Check template-bundled skills: #48 metadata conformance + cross-reference closure (#119).
+
+Zero-dependency (stdlib only). Enumerates SKILL.md files *tracked by git* under skills/ — that is
+exactly the bundled set: mounted skills are gitignored, so they are out of scope by construction
+(same trick as check-secret-scan). For each bundled skill dir it composes the sibling scripts:
+
+  - check-asset-metadata --payload-ok <dir>   payload .md files (templates/, references/) carry no
+    frontmatter by design; only id-bearing files are asset records
+  - check-asset-refs <dir> [<dir> …]          SKILL.md `regression:` must resolve to the
+    regression/REGRESSION.md asset record, dependencies must close
+
+The cross-reference pass runs ONCE over every bundled skill dir at a time, not once per dir: the
+bundled skills are one tracked set and may legitimately depend on each other (`skill:sre-autofix`
+-> `skill:incident-fix`), which a per-dir id-set could never resolve. The scan stays limited to the
+dirs enumerated above, so mounted (gitignored) skills never enter the id-set.
+
+**Zero bundled skills is a failure, not a pass** (the vacuous-green law of check-asset-metadata,
+applied here): the template ships bundled skills; finding none means the scan is pointed at
+nothing and health would be asserting an unchecked claim.
+
+argv[1] overrides the scan root (a dir whose children are skill dirs, found by SKILL.md presence
+instead of git tracking) — used by check-health --self-test fixtures. Outside a git checkout with
+no override, degrades to SKIP like check-secret-scan.
+"""
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+PY = sys.executable or "python3"
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+if len(sys.argv) > 1:
+    base = pathlib.Path(sys.argv[1]).resolve()
+    skill_dirs = sorted(p.parent for p in base.glob("*/SKILL.md"))
+    where = base
+else:
+    r = run(["git", "-C", str(root), "ls-files", "--", "skills/*/SKILL.md"])
+    if r.returncode != 0:
+        print("SKIP: not a git checkout — the bundled-skill scan needs `git ls-files` to tell "
+              "bundled (tracked) from mounted (ignored) skills")
+        sys.exit(0)
+    skill_dirs = sorted((root / line).parent for line in r.stdout.splitlines() if line.strip())
+    where = "skills/"
+
+if not skill_dirs:
+    print("FAIL: bundled skills")
+    print(f"  - no bundled skill (dir with SKILL.md) found under {where} — zero coverage is not a")
+    print("    pass. The template ships bundled skills (see skills/README.md); if they were removed")
+    print("    on purpose, retire this check in the same PR instead of letting it scan nothing.")
+    sys.exit(1)
+
+errors = []
+
+
+def collect(cmd):
+    r = run(cmd)
+    if r.returncode != 0:
+        for ln in r.stdout.strip().splitlines():
+            if ln.strip().startswith("-"):
+                errors.append(ln.strip().lstrip("- "))
+
+
+# metadata conformance is per-skill; cross-reference closure is over the bundled set as a whole
+for d in skill_dirs:
+    collect([PY, str(root / "scripts" / "check-asset-metadata"), "--payload-ok", str(d)])
+collect([PY, str(root / "scripts" / "check-asset-refs")] + [str(d) for d in skill_dirs])
+
+if errors:
+    print("FAIL: bundled skills")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+
+names = ", ".join(d.name for d in skill_dirs)
+print(f"OK: {len(skill_dirs)} bundled skill(s) ({names}) — metadata conforms, cross-references resolve")

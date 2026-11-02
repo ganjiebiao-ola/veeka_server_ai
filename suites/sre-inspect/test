@@ -1,0 +1,68 @@
+#!/usr/bin/env sh
+# suites/sre-inspect/test — suite tests (#43 convention). Offline: no Grafana, no docker, no gh, no LLM.
+# python unittest over fixtures + fakes, the two bundled skills' smokes, the toolset credential guard,
+# SUITE.md id/entry consistency, and the project-noun / mounted-repo-id guards. Runs under `ws test`.
+set -u
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root="$(CDPATH= cd -- "$here/../.." && pwd)"
+rc=0
+out="$(cd "$here" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t tests -p 'test_*.py' 2>&1)" || rc=1
+printf '%s\n' "$out" | tail -n 3
+ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9]*\) tests\{0,1\}.*/\1/p' | tail -n 1)"
+[ -n "$ran" ] && [ "$ran" -gt 0 ] || { echo "FAIL: sre-inspect: no tests ran (vacuous green refused)"; rc=1; }
+for sk in grafana-sls sre-inspect; do
+  "$root/skills/$sk/regression/smoke.sh" "$root" || rc=1
+done
+grep -q "^id: sre-inspect$" "$here/SUITE.md" || { echo "FAIL: SUITE.md id != sre-inspect"; rc=1; }
+grep -q "^entry: suites/sre-inspect/$" "$here/SUITE.md" || { echo "FAIL: SUITE.md entry != suites/sre-inspect/"; rc=1; }
+# credential guard over the Holmes custom toolsets (port of ola-sre-agent toolset_guard_test.go)
+python3 - "$here" <<'PY' || rc=1
+import sys, os
+sys.path.insert(0, sys.argv[1])
+from lib.cli import toolset_guard
+p = toolset_guard(sys.argv[1])
+if p:
+    print("FAIL: toolset guard\n  - " + "\n  - ".join(p)); sys.exit(1)
+PY
+# the shipped example config must parse and validate as-is (what a department copies)
+python3 - "$here" <<'PY' || rc=1
+import sys, os, shutil, tempfile
+sys.path.insert(0, sys.argv[1])
+from lib import tenant as T
+d = tempfile.mkdtemp()
+try:
+    shutil.copy(os.path.join(sys.argv[1], "tenant.yaml.example"), os.path.join(d, "tenant.yaml"))
+    shutil.copy(os.path.join(sys.argv[1], "routes.yaml.example"), os.path.join(d, "routes.yaml"))
+    shutil.copytree(os.path.join(sys.argv[1], "triage"), os.path.join(d, "triage"))
+    t = T.load(d); p = T.validate(t); r, _ = T.load_routes(d, t); p += T.validate_routes(r, d, t)
+    if p: print("FAIL: tenant.yaml.example/routes.yaml.example do not validate:\n  - " + "\n  - ".join(p)); sys.exit(1)
+finally:
+    shutil.rmtree(d)
+PY
+# portability guards: no mounted-repo id and no upstream project noun in TEMPLATE-OWNED content files.
+# Scope is defined by git, not by directory walks: tracked + untracked-not-ignored files under the
+# suite (so gitignored local files — env/.env.*, *.local.yaml, holmes/.holmes/, tool-results/ — are
+# out by construction), narrowed to the paths the template owns (a department instance legitimately
+# commits its own tenant.yaml / routes.yaml / triage/<rule>.md with its own nouns — those are not
+# scanned). No grep --exclude/--exclude-dir: BSD grep (macOS) matches those globs against the full
+# path, GNU against the basename, and the difference produced a false FAIL on the first Mac run.
+tmpl_files="$(cd "$root" && git ls-files --cached --others --exclude-standard -- suites/sre-inspect 2>/dev/null \
+  | grep -E '^suites/sre-inspect/(run|SUITE\.md|tenant\.yaml\.example|routes\.yaml\.example|(lib|docs|tools|toolsets|mcp)/|holmes/(config\.yaml\.example|docker-compose\.yaml)$|env/holmes-env\.example$|triage/(README\.md|_template\.md)$)' \
+  | grep -v '/__pycache__/')"
+if [ -z "$tmpl_files" ]; then
+  echo "SKIP: template-file guards need a git checkout (git ls-files found nothing)"
+else
+  ids=$(awk '/^repositories:/{f=1;next} /^[A-Za-z_]/{f=0} f && /^[[:space:]]*- id:/{sub(/.*- id:[[:space:]]*/,""); print}' "$root/workspace.yaml")
+  for id in $ids; do
+    if printf '%s\n' "$tmpl_files" | (cd "$root" && xargs grep -lw -- "$id" 2>/dev/null) | grep -q .; then
+      echo "FAIL: mounted-repo id leaked into suite files: $id"; rc=1
+    fi
+  done
+  leaked="$(printf '%s\n' "$tmpl_files" | (cd "$root" && xargs grep -liE 'olachat|pt-oversea|pazzy|partying|BlindBox|BbcStrategy|LivePk|5569189085140179' 2>/dev/null))"
+  if [ -n "$leaked" ]; then
+    echo "FAIL: upstream project noun leaked into suite files:"; printf '  %s\n' $leaked; rc=1
+  fi
+fi
+find "$here" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+[ "$rc" = 0 ] && echo "OK: sre-inspect test passed ($ran unit tests + 2 skill smokes + guards)" || echo "FAIL: sre-inspect test"
+exit $rc

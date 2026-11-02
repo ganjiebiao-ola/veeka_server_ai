@@ -1,0 +1,117 @@
+{
+  "meta": {
+    "since": "2026-08-10",
+    "until": "2026-08-16",
+    "generated_at": "2026-09-15T21:34:56+08:00",
+    "claude_files": 4,
+    "codex_files": 1,
+    "base_source": "native",
+    "ext_note": "外部源未启用(--source native)"
+  },
+  "claude": {
+    "totals": {
+      "messages": 4,
+      "input": 400,
+      "output": 200,
+      "cache_read": 1010,
+      "cache_creation": 5,
+      "thinking": 20
+    },
+    "by_bucket": {
+      "other": {
+        "messages": 4,
+        "input": 400,
+        "output": 200,
+        "cache_read": 1010,
+        "cache_creation": 5,
+        "sessions": 3,
+        "inferred": false
+      }
+    },
+    "by_model": {
+      "claude-fable-5": {
+        "messages": 3,
+        "input": 200,
+        "output": 100
+      },
+      "claude-sonnet-5": {
+        "messages": 1,
+        "input": 200,
+        "output": 100
+      }
+    },
+    "by_day": {
+      "2026-08-10": {
+        "messages": 4,
+        "input": 400,
+        "output": 200,
+        "cache_read": 1010,
+        "cache_creation": 5
+      }
+    },
+    "by_hour": {
+      "20": 3,
+      "21": 1
+    },
+    "sessions": {
+      "count": 3,
+      "median_minutes": 9.9
+    },
+    "sidechain": {
+      "messages": 2,
+      "output": 50
+    },
+    "cells": [
+      {
+        "day": "2026-08-10",
+        "bucket": "other",
+        "model": "claude-fable-5",
+        "messages": 3,
+        "input": 200,
+        "output": 100,
+        "cache_read": 10,
+        "cache_creation": 5
+      },
+      {
+        "day": "2026-08-10",
+        "bucket": "other",
+        "model": "claude-sonnet-5",
+        "messages": 1,
+        "input": 200,
+        "output": 100,
+        "cache_read": 1000,
+        "cache_creation": 0
+      }
+    ],
+    "by_branch": {}
+  },
+  "codex": {
+    "totals": {
+      "sessions": 1,
+      "input": 1000,
+      "cached_input": 800,
+      "output": 200,
+      "reasoning": 50
+    },
+    "sessions_with_usage": 1,
+    "by_bucket": {
+      "other": {
+        "sessions": 1,
+        "input": 1000,
+        "cached_input": 800,
+        "output": 200,
+        "reasoning": 50,
+        "inferred": false
+      }
+    }
+  },
+  "git": {
+    "workspace": {
+      "commits": 6,
+      "insertions": 754,
+      "deletions": 166
+    }
+  },
+  "external": null,
+  "reconciliation": null
+}

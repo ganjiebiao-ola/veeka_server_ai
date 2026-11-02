@@ -1,0 +1,25 @@
+{
+  "kind": "new",
+  "resource": "Claude Team seat ×2",
+  "business": "<业务/职能>",
+  "project": "<mounted-repo-id or project>",
+  "purpose": "现有 Codex 额度周四即用尽;<项目> 的 <任务> 需要长上下文模型 —— 写清用什么、做什么、现有资源为何不够",
+  "outcome": "两周内完成 <交付物> 并通过 <验证方式> —— 可核验的产出,不写「提升效率」这种没法验的话",
+  "amount": 400,
+  "currency": "USD",
+  "start": "2026-10-01",
+  "end": "2026-12-31",
+  "renewal": "manual",
+  "allocation": "split",
+  "split": [
+    {
+      "target": "<mounted-repo-id>",
+      "ratio": 70
+    },
+    {
+      "target": "workspace",
+      "ratio": 30
+    }
+  ],
+  "note": "先用一个月看利用率;已确认公司现有方案没有等价资源"
+}

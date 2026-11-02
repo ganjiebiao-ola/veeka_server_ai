@@ -1,0 +1,131 @@
+{
+ "report_version": "1.1",
+ "scenario": "dive",
+ "trigger": "alert",
+ "generated_at": "2026-01-01T00:10:00Z",
+ "generator": "sre-orchestrator/report",
+ "incident": {
+  "id": "INC-20260101-000000-deadbeef",
+  "fingerprint": "deadbeefcafe0001",
+  "rule_uid": "rule-example-5xx",
+  "rid": "R-01",
+  "rule_name": "API | 5xx",
+  "layer": "L6",
+  "subject": "example-api",
+  "title": "example-api 5xx rate above threshold",
+  "eval_epoch": 1786440000,
+  "occurrences": 1,
+  "archive_dir": "/app/incidents/2026-01-01/INC-20260101-000000-deadbeef"
+ },
+ "status": {
+  "state": "ROOT_CAUSED",
+  "terminal": false,
+  "needs_human": false,
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:10:00Z"
+ },
+ "verdict": {
+  "value": "FAIL",
+  "source": "triage",
+  "template": "api-5xx.md",
+  "summary": "真异常",
+  "known_pattern": [],
+  "mentioned_patterns": []
+ },
+ "root_cause": {
+  "source": "packing",
+  "statement": "ExampleSrv.php:21 在 RPC 返回 false/空时抛出未捕获异常，被框架转为 500",
+  "chain": [
+   "[数据] t=1786439012 起 app 日志出现 Exception ERROR_SERVICE_ABNORMAL_TRY_AGAIN，File: ExampleSrv.php:21",
+   "[数据] 同窗 RPC 侧日志显示 IsFeatureEnabled 对 3% 请求返回空（下游灰度中）",
+   "[推断] ExampleSrv 未区分「下游按契约返回空」与「下游故障」，两者都抛异常 → 500"
+  ],
+  "confidence": "high",
+  "confidence_basis": "异常栈直接指向 ExampleSrv.php:21，且 RPC 返回空的比例与 500 比例吻合",
+  "cause_locus": "code_defect",
+  "cause_locus_basis": "下游按契约返回空属正常现象，代码仍出错——是代码缺陷",
+  "severity": "medium",
+  "severity_basis": "30 分钟窗内 42 次 500，占该接口请求 3.1%，无级联影响",
+  "impact": {
+   "scope": "接口 /feature/status；调用它的客户端首页开关",
+   "magnitude": "42 次 500 / 1352 次请求（3.1%），持续 28 分钟",
+   "time_window": "1786439000–1786440680 (epoch)"
+  },
+  "repro": {
+   "conditions": "下游 RpcExample::IsFeatureEnabled 返回 false/空时，ExampleSrv.php:21 直接 throw",
+   "frequency": "间歇：与下游返回空的比例一致"
+  },
+  "suggested_fix": "ExampleSrv.php 里区分「返回空=未启用」与真正的调用失败；返回空时应返回 false 而不是抛异常，修复后该场景不应再产生 500"
+ },
+ "evidence": [
+  {
+   "claim": "500 由 ExampleSrv.php:21 的异常引起",
+   "tool": "sls_execute_sql",
+   "ref": "ev://INC-20260101-000000-deadbeef/tool/call_0001",
+   "archived": true,
+   "archive_path": "tool/L1-call_0001.json",
+   "matched_by": "id",
+   "query": "* and \"ExampleSrv.php:21\" and level:ERROR",
+   "time_window": "1786439000–1786440680"
+  },
+  {
+   "claim": "RPC 对 3% 请求返回空，与 500 比例一致",
+   "tool": "sls_execute_sql",
+   "ref": "ev://INC-20260101-000000-deadbeef/tool/call_0002",
+   "archived": true,
+   "archive_path": "tool/L1-call_0002.json",
+   "matched_by": "id",
+   "query": "* and \"IsFeatureEnabled\" | select count(*) where res='' ",
+   "time_window": "1786439000–1786440680"
+  },
+  {
+   "claim": "下游 RPC 服务本身健康，无错误率上升",
+   "tool": "execute_prometheus_range_query",
+   "ref": "ev://INC-20260101-000000-deadbeef/tool/call_0003",
+   "archived": true,
+   "archive_path": "tool/L1-call_0003.json",
+   "matched_by": "id",
+   "query": "sum(rate(rpc_errors_total{svc=\"example\"}[5m]))",
+   "time_window": "1786435400–1786440680"
+  }
+ ],
+ "excluded_hypotheses": [
+  {
+   "hypothesis": "下游 RPC 服务故障",
+   "why_ruled_out": "Prometheus 错误率为 0，返回空是灰度中的契约内行为"
+  }
+ ],
+ "data_gaps": [
+  "未拿到灰度开关的具体配置值"
+ ],
+ "suspect_change": "none",
+ "duplicate_of": "none",
+ "unfixable_reason": "",
+ "data_sources": [
+  "sls:example/app",
+  "prometheus"
+ ],
+ "sufficiency": {
+  "total": 88,
+  "grade": "充分"
+ },
+ "cost": {
+  "incident_usd": 0.21,
+  "tool_calls": 14,
+  "dive_duration_sec": 410.5
+ },
+ "degradations": [],
+ "timeline": [],
+ "attachments": {
+  "alert": "alert.json",
+  "draft": "bugissue-draft.json",
+  "issue_md": "issue.draft.md"
+ },
+ "completeness": {
+  "missing": []
+ },
+ "scrub": {
+  "findings": [],
+  "egress_blocked": false
+ }
+}

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Pull the latest default branch for every mounted repo that is clean and on its default branch.
+
+Zero-dependency (stdlib only), structural sibling of scripts/setup-repos. Reads the mount list from
+workspace.local.yaml (the gitignored sidecar), iterates each repo, and runs `git pull --ff-only` for
+repos that are on their default branch with a clean working tree. Repos on a feature branch or with
+uncommitted changes are deliberately skipped — you don't want upstream main merged into your dev work.
+"""
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+local_file = root / "workspace.local.yaml"
+
+# Same rule as is_safe_component in scripts/setup-repos.
+_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+# scripts/setup-skills writes its block after repositories:, so parsing stops there.
+_SKILLS_SENTINEL = "# >>> setup-skills managed block"
+
+_USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def _green(s):
+    return "\033[32m" + s + "\033[0m" if _USE_COLOR else s
+
+
+def _yellow(s):
+    return "\033[33m" + s + "\033[0m" if _USE_COLOR else s
+
+
+def _red(s):
+    return "\033[31m" + s + "\033[0m" if _USE_COLOR else s
+
+
+# ---------------------------------------------------------------------------
+# Parses workspace.local.yaml the same way as read_local_repos in scripts/setup-repos.
+# ---------------------------------------------------------------------------
+def read_local_repos():
+    # type: () -> list[dict]
+    """Return [{id, path}, ...] in file order."""
+    if not local_file.exists():
+        return []
+    repos = []
+    cur = None
+    in_block = False
+    for raw in local_file.read_text(encoding="utf-8").splitlines():
+        if in_block and raw.startswith(_SKILLS_SENTINEL):
+            break
+        if re.match(r"^repositories:\s*$", raw):
+            in_block = True
+            continue
+        if in_block and re.match(r"^[A-Za-z_]", raw):
+            break
+        if not in_block:
+            continue
+        if re.match(r"^\s*-\s*id:", raw):
+            m = re.match(r"^\s*-\s*id:\s*(.+)$", raw)
+            cand = m.group(1).split("#", 1)[0].strip().strip("\"'") if m else ""
+            if not _ID_RE.match(cand):
+                cur = None
+                continue
+            cur = cand
+            repos.append({"id": cur, "path": "repos/" + cur})
+            continue
+        m_path = re.match(r"^\s+path:\s*(.+)$", raw)
+        if m_path and cur is not None:
+            path_val = m_path.group(1).split("#", 1)[0].strip().strip("\"'")
+            if path_val:
+                repos[-1]["path"] = path_val
+    return repos
+
+
+def _run(args, cwd):
+    r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def _default_branch(repo_dir):
+    rc, out = _run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo_dir)
+    if rc == 0 and out:
+        return out.replace("origin/", "", 1)
+    return "main"
+
+
+def _current_branch(repo_dir):
+    rc, out = _run(["git", "symbolic-ref", "--short", "HEAD"], repo_dir)
+    return out if rc == 0 else None
+
+
+def _is_clean(repo_dir):
+    rc, out = _run(["git", "status", "--porcelain"], repo_dir)
+    return rc == 0 and out == ""
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__.strip().splitlines()[0])
+        print()
+        print("usage: scripts/update-repos")
+        sys.exit(0)
+
+    if not local_file.exists():
+        print(_red("✗") + " workspace.local.yaml not found — run scripts/setup-repos first")
+        sys.exit(1)
+
+    repos = read_local_repos()
+    if not repos:
+        print(_yellow("⊘") + " no repositories found in workspace.local.yaml")
+        sys.exit(0)
+
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    for entry in repos:
+        rid = entry["id"]
+        repo_dir = root / entry["path"]
+
+        if not repo_dir.is_dir() or not (repo_dir / ".git").exists():
+            print(_red("✗") + " " + rid + " — not found")
+            errors += 1
+            continue
+
+        default = _default_branch(repo_dir)
+        current = _current_branch(repo_dir)
+
+        if current is None:
+            print(_red("✗") + " " + rid + " — could not determine current branch")
+            errors += 1
+            continue
+
+        if current != default:
+            print(_yellow("⊘") + " " + rid + " — on branch " + current + ", skipped")
+            skipped += 1
+            continue
+
+        if not _is_clean(repo_dir):
+            print(_yellow("⊘") + " " + rid + " — has uncommitted changes, skipped")
+            skipped += 1
+            continue
+
+        rc_fetch, _ = _run(["git", "fetch", "origin"], repo_dir)
+        if rc_fetch != 0:
+            print(_red("✗") + " " + rid + " — git fetch failed")
+            errors += 1
+            continue
+
+        rc_pull, pull_out = _run(["git", "pull", "--ff-only"], repo_dir)
+        if rc_pull != 0:
+            print(_red("✗") + " " + rid + " — git pull --ff-only failed")
+            errors += 1
+            continue
+
+        print(_green("✓") + " " + rid)
+        updated += 1
+
+    print()
+    parts = []
+    parts.append(str(updated) + " updated")
+    parts.append(str(skipped) + " skipped")
+    parts.append(str(errors) + " error" + ("s" if errors != 1 else ""))
+    print(", ".join(parts))
+
+    sys.exit(1 if errors > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()

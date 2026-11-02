@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Record which upstream template commit this workspace's framework paths match: workspace.yaml `upstream.synced_commit`.
+
+Usage: scripts/upstream-pin <full-40-hex-sha>
+The sync skill runs it right after `git merge upstream/<branch>`; scripts/check-ownership compares framework
+paths against this pin. Refuses a sha that is not a commit present locally (fetch first). Zero-dependency.
+"""
+import pathlib
+import re
+import subprocess
+import sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+sha = sys.argv[1] if len(sys.argv) > 1 else ""
+if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    sys.exit("usage: upstream-pin <full 40-hex commit sha>")
+if subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{sha}^{{commit}}"], capture_output=True).returncode != 0:
+    sys.exit(f"FAIL: {sha[:7]} is not a commit present in this clone — git fetch the upstream first")
+ws = root / "workspace.yaml"
+text = ws.read_text()
+new, n = re.subn(r"(?m)^(  synced_commit:\s*)[^#\n]*?(\s+#.*)?$", lambda m: f"{m.group(1)}{sha}{m.group(2) or ''}", text)
+if n != 1:
+    sys.exit("FAIL: workspace.yaml has no `upstream:` block with one `  synced_commit:` line (see the seed workspace.yaml)")
+ws.write_text(new)
+print(f"OK: upstream.synced_commit -> {sha[:7]}")

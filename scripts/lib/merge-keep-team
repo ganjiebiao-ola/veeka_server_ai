@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# scripts/lib/merge-keep-team — the `merge=ours` driver behind .gitattributes: keeps the TEAM's side of a
+# seed / generated file in both directions (platform-internals/ownership.yaml).
+#
+# git calls a merge driver as `<driver> %O %A %B` (base, ours, theirs) and expects the result in %A.
+# On `git merge upstream/<branch>` the team is "ours" (HEAD), so leaving %A alone is right. On
+# `git rebase` git swaps the sides: HEAD is the upstream commit being rebased onto and the replayed
+# team commit is "theirs" — a plain `true` driver would then silently DROP the team's change (no
+# conflict, no marker). So while a rebase is in progress this copies %B over %A instead. A cherry-pick
+# keeps HEAD's side (a contrib/* cherry-pick never carries seeds). Configured once per clone by the
+# workspace-upstream-sync skill's preflight:
+#   git config merge.ours.driver 'scripts/lib/merge-keep-team %O %A %B'
+# (git runs merge drivers from the work-tree root, so the relative path resolves.) Exit 0 = merged cleanly.
+set -e
+ours="$2"; theirs="$3"
+[ -n "$theirs" ] || { echo "merge-keep-team: usage: merge-keep-team %O %A %B" >&2; exit 1; }
+gitdir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+  cp "$theirs" "$ours"     # rebase: the team's version is the replayed commit (theirs)
+fi
+exit 0

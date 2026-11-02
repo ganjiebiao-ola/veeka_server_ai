@@ -1,0 +1,134 @@
+{
+ "meta": {
+  "schema_version": 2,
+  "week": "2026-W33",
+  "since": "2026-08-10",
+  "until": "2026-08-16",
+  "human_id": "bob",
+  "team": "fixture-team",
+  "business": "fixture-biz",
+  "timezone": "Asia/Singapore",
+  "submission_version": 1,
+  "generated_at": "2026-08-17T09:00:00+08:00",
+  "workspace_sha": "abcdef0123456789",
+  "tool": "ai-usage-weekly",
+  "base_source": "native"
+ },
+ "usage": {
+  "requests": 10,
+  "input": 1000,
+  "output": 500,
+  "cache_read": 4000,
+  "cache_creation": 0,
+  "cache_hit_rate": 0.8,
+  "sessions": 2,
+  "task_instances": 2,
+  "by_day": {
+   "2026-08-10": {
+    "requests": 5,
+    "input": 500,
+    "output": 200,
+    "cache_read": 0,
+    "cache_creation": 0,
+    "cost": 0.5
+   }
+  },
+  "by_model": {
+   "claude-fable-5": {
+    "requests": 10,
+    "input": 1000,
+    "output": 500,
+    "cache_read": 4000,
+    "cache_creation": 0,
+    "cost": 1.25
+   }
+  },
+  "by_bucket": {
+   "alpha": {
+    "requests": 7,
+    "tokens": 4000,
+    "cost": 0.9
+   },
+   "workspace": {
+    "requests": 3,
+    "tokens": 1500,
+    "cost": 0.35
+   }
+  },
+  "by_agent": {
+   "claude": {
+    "messages": 10,
+    "input": 1000,
+    "output": 500,
+    "cache_read": 4000,
+    "cache_creation": 0
+   },
+   "codex": null
+  },
+  "cells": [
+   {
+    "day": "2026-08-10",
+    "model": "claude-fable-5",
+    "bucket": "alpha",
+    "requests": 6,
+    "input": 600,
+    "output": 300,
+    "cache_read": 2400,
+    "cache_creation": 0,
+    "source": "local-usage-log"
+   },
+   {
+    "day": "2026-08-12",
+    "model": "claude-fable-5",
+    "bucket": "workspace",
+    "requests": 4,
+    "input": 400,
+    "output": 200,
+    "cache_read": 1600,
+    "cache_creation": 0,
+    "source": "local-usage-log"
+   }
+  ]
+ },
+ "cost": {
+  "estimated": {
+   "amount": 1.25,
+   "currency": "USD",
+   "nature": "api",
+   "source": "local-usage-log",
+   "method": "price-table",
+   "pricing_version": "test-1",
+   "unpriced_models": [],
+   "period": {
+    "since": "2026-08-10",
+    "until": "2026-08-16"
+   },
+   "confirmed": false,
+   "note": "fixture"
+  },
+  "actual": null,
+  "allocated": null
+ },
+ "git": {
+  "alpha": {
+   "commits": 3,
+   "insertions": 120,
+   "deletions": 20
+  }
+ },
+ "quality": {
+  "missing_sources": [
+   "platform-export",
+   "actual-bill"
+  ],
+  "unpriced_models": [],
+  "shared_costs": [],
+  "allocation": [],
+  "confirmed_by": {
+   "member": null,
+   "billing": null,
+   "attribution": null
+  }
+ },
+ "narrative": null
+}

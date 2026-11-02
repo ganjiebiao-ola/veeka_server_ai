@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+# check-repo-agent-entries — verify a (mounted) repo's root agent entries carry the canonical
+# workspace security block: both CLAUDE.md and AGENTS.md present, each with a marker-wrapped
+# block whose blob= SHA matches the current agent-instructions/security-defaults.md, and the two
+# block bodies byte-identical (runtime equivalence of the security part).
+#
+# On-demand / skill self-verify tool (workspace-context-bootstrap optional step runs it before
+# delivering). Deliberately NOT wired into `ws health`: mounted repos are machine-local and vary
+# per operator, so this cannot be a deterministic green-line check.
+#
+# Usage: scripts/check-repo-agent-entries <repo-path> [workspace-root=.]
+set -e
+repo="${1:?usage: check-repo-agent-entries <repo-path> [workspace-root]}"
+ws="${2:-.}"
+fail=0
+src="$ws/agent-instructions/security-defaults.md"
+[ -d "$repo" ] || { echo "FAIL: repo path not found: $repo"; exit 1; }
+[ -f "$src" ] || { echo "FAIL: security-defaults source not found: $src"; exit 1; }
+want=$(git hash-object "$src")
+
+for f in CLAUDE.md AGENTS.md; do
+  p="$repo/$f"
+  [ -f "$p" ] || { echo "FAIL: $repo missing $f"; fail=1; continue; }
+  grep -q "BEGIN workspace-security-defaults" "$p" || {
+    echo "FAIL: $f has no workspace-security-defaults block"; fail=1; continue; }
+  got=$(sed -n 's/.*BEGIN workspace-security-defaults.*blob=\([0-9a-f]\{40\}\).*/\1/p' "$p" | head -n1)
+  [ -n "$got" ] || { echo "FAIL: $f security block carries no blob= source SHA"; fail=1; continue; }
+  [ "$got" = "$want" ] || { echo "FAIL: $f security block is stale (blob $got, want $want)"; fail=1; }
+done
+
+if [ "$fail" = 0 ]; then
+  a=$(mktemp); b=$(mktemp)
+  sed -n '/BEGIN workspace-security-defaults/,/END workspace-security-defaults/p' "$repo/CLAUDE.md" >"$a"
+  sed -n '/BEGIN workspace-security-defaults/,/END workspace-security-defaults/p' "$repo/AGENTS.md" >"$b"
+  cmp -s "$a" "$b" || { echo "FAIL: security blocks differ between CLAUDE.md and AGENTS.md"; fail=1; }
+  rm -f "$a" "$b"
+fi
+
+[ "$fail" = 0 ] && echo "OK: $repo agent entries carry the current workspace security block" || echo "FAIL"
+exit $fail

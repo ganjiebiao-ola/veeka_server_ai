@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+# suites/sre-autofix/test — suite tests (#43 convention). Offline, no gh, no LLM, no mounted repo:
+# python unittest over fixtures + a throwaway git repo, the two bundled skills' smoke scripts, and
+# portability / project-noun guards. Runs under `ws test` and `ws regression`.
+set -u
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root="$(CDPATH= cd -- "$here/../.." && pwd)"
+rc=0
+out="$(cd "$here" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t tests -p 'test_*.py' 2>&1)" || rc=1
+printf '%s\n' "$out" | tail -n 3
+ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9]*\) tests\{0,1\}.*/\1/p' | tail -n 1)"
+[ -n "$ran" ] && [ "$ran" -gt 0 ] || { echo "FAIL: sre-autofix: no tests ran (vacuous green refused)"; rc=1; }
+for sk in incident-fix sre-autofix; do
+  "$root/skills/$sk/regression/smoke.sh" "$root" || rc=1
+done
+# SUITE.md id/entry consistent with the directory (campaign-stub/test pattern)
+grep -q "^id: sre-autofix$" "$here/SUITE.md" || { echo "FAIL: SUITE.md id != sre-autofix"; rc=1; }
+grep -q "^entry: suites/sre-autofix/$" "$here/SUITE.md" || { echo "FAIL: SUITE.md entry != suites/sre-autofix/"; rc=1; }
+# portability: no mounted-repo id (repositories[] only — the suite's own id is a legitimate word here)
+ids=$(awk '/^repositories:/{f=1;next} /^[A-Za-z_]/{f=0} f && /^[[:space:]]*- id:/{sub(/.*- id:[[:space:]]*/,""); print}' "$root/workspace.yaml")
+for id in $ids; do
+  # content files only: test sources and this script carry ban lists that legitimately name repos
+  if grep -rqw --exclude-dir=__pycache__ -- "$id" "$here/lib" "$here/tests/fixtures" "$here/docs" "$here/run" "$here/SUITE.md"; then
+    echo "FAIL: mounted-repo id leaked into suite files: $id"; rc=1
+  fi
+done
+# upstream project nouns must not enter the template (they travel only inside an incident's brief)
+# (test sources carry the ban list itself; content files — lib, fixtures, docs, contract — must not)
+if grep -rqiE 'olachat|pt-oversea|pazzy|BlindBox|BbcStrategy|LivePk' "$here/lib" "$here/tests/fixtures" "$here/docs" "$here/SUITE.md" "$here/run"; then
+  echo "FAIL: upstream project noun leaked into suite files"; rc=1
+fi
+find "$here" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+[ "$rc" = 0 ] && echo "OK: sre-autofix test passed ($ran unit tests + 2 skill smokes)" || echo "FAIL: sre-autofix test"
+exit $rc

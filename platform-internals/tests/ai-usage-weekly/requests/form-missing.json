@@ -1,0 +1,24 @@
+{
+ "kind": "new",
+ "resource": "Claude Team seat ×2",
+ "business": "fixture-biz",
+ "project": "alpha",
+ "outcome": "FIXTURE-OUTCOME 两周内完成探测重构 PR 并通过线上三场景验证",
+ "amount": 400,
+ "currency": "USD",
+ "start": "2026-09-01",
+ "end": "2026-11-30",
+ "renewal": "manual",
+ "allocation": "split",
+ "split": [
+  {
+   "target": "alpha",
+   "ratio": 70
+  },
+  {
+   "target": "workspace",
+   "ratio": 30
+  }
+ ],
+ "note": "FIXTURE-NOTE 先用一个月看利用率"
+}

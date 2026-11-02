@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Aggregate workspace health checks; --self-test proves the planted detection classes (#50, #119).
+
+Zero-dependency (stdlib only). Normal mode orchestrates the independent check-* scripts and rolls up
+their exit codes: 0 = OK, 2 = WARN (a non-blocking gap — surfaced, not a gate
+failure), anything else = FAIL. `--self-test` scans platform-internals/tests/ and asserts each planted problem is
+caught — the five classes #50 must detect (missing asset, wrong version, stale context,
+regression decay, unguarded destructive op) plus the vacuous-green class: an asset scan with
+nothing to scan must fail rather than report zero-coverage as a pass; #119 adds the bundled-skill
+pair (dangling regression pointer in a skill dir, and the bundled-skill scan finding no skills at
+all — both must fail rather than read as green). This is the health runner
+#48/#49 deferred to #50; it composes the sibling scripts wherever one exists — the
+unguarded-destructive scan is the one check with no standalone sibling yet, so the self-test
+carries it inline.
+"""
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import pathlib
+
+root = pathlib.Path(__file__).resolve().parent.parent
+PY = sys.executable or "python3"
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def normal_health():
+    checks = [
+        ("structure + manifest", [PY, str(root / "scripts" / "check-workspace")]),
+        ("asset metadata",       [PY, str(root / "scripts" / "check-asset-metadata")]),
+        ("asset cross-refs",     [PY, str(root / "scripts" / "check-asset-refs")]),
+        ("bundled skills",       [PY, str(root / "scripts" / "check-bundled-skills")]),
+        ("context freshness",    [PY, str(root / "scripts" / "check-context-freshness")]),
+        ("code maps",            [PY, str(root / "scripts" / "check-map")]),
+        ("local permissions",    [PY, str(root / "scripts" / "check-permissions")]),
+        ("secret scan",          [PY, str(root / "scripts" / "check-secret-scan")]),
+        ("ownership",            [PY, str(root / "scripts" / "check-ownership")]),
+        ("generated files",      [PY, str(root / "scripts" / "check-generated")]),
+    ]
+    print("workspace health:")
+    failed = 0
+    warned = 0
+    for name, cmd in checks:
+        r = run(cmd)
+        # Exit code vocabulary: 0 = OK, 2 = WARN (the check could not scan anything — reported, but
+        # not a gate failure), anything else = FAIL.
+        status = "OK  " if r.returncode == 0 else ("WARN" if r.returncode == 2 else "FAIL")
+        lines = [ln.strip() for ln in r.stdout.strip().splitlines() if ln.strip()]
+        # A failing check prints a verdict line ("FAIL: …") followed by "- detail" lines. Taking the
+        # *last* line as the summary picked up a detail that the loop below then printed again, so one
+        # problem read as two. Prefer the verdict line; details are printed once, underneath it.
+        summary = next((ln for ln in lines if ln.startswith(("FAIL:", "WARN:", "OK:"))), lines[-1] if lines else "")
+        if not summary and r.stderr.strip():      # crashed before printing a verdict (e.g. ERROR: …)
+            summary = r.stderr.strip().splitlines()[-1]
+        print(f"  [{status}] {name}: {summary}")
+        for ln in lines:
+            if ln.startswith("READINESS:"):
+                print(f"         {ln}")
+        if status != "OK  ":
+            failed += status == "FAIL"
+            warned += status == "WARN"
+            for ln in lines:
+                if ln.startswith("-") and ln != summary:
+                    print(f"         {ln}")
+    if failed:
+        print(f"FAIL: {failed} health check(s) failed")
+        return 1
+    if warned:
+        print(f"OK: all health checks passed ({warned} warning(s) — see [WARN] above)")
+        return 0
+    print("OK: all health checks passed")
+    return 0
+
+
+def missing(paths):
+    """Report absent inputs as a FAIL with a repair hint, never as a traceback.
+
+    A self-test that crashes tells the reader nothing about what to restore, and a self-test that
+    silently skips a class is worse than one that fails: `ws health` would stay green while a
+    detector it claims to prove had quietly stopped being exercised.
+    """
+    print("FAIL: health self-test cannot run")
+    for p in paths:
+        print(f"  - missing input: {p}")
+    print("  - platform-internals/tests/ and platform-internals/schemas/ are not optional: they are")
+    print("    what proves the health checks actually fire. Restore them from the template.")
+    return 1
+
+
+def self_test():
+    fx = root / "platform-internals" / "tests"
+
+    schema_file = root / "platform-internals" / "schemas" / "asset-metadata.schema.json"
+    inputs = {
+        "schema":      schema_file,
+        "wrong-ver":   fx / "wrong-version" / "ASSET.md",
+        "stale":       fx / "stale-context" / "fragment.yaml",
+        "destructive": fx / "unguarded-destructive" / "bad.sh",
+    }
+    dirs = {
+        "missing-asset":    fx / "missing-asset",
+        "regression-decay": fx / "regression-decay",
+        "empty-asset-dir":  fx / "empty-asset-dir",
+        "bundled-dangling": fx / "bundled-skill-dangling",
+    }
+    absent = [p.relative_to(root) for p in inputs.values() if not p.is_file()]
+    absent += [p.relative_to(root) for p in dirs.values() if not p.is_dir()]
+    if absent:
+        return missing(absent)
+
+    results = []
+
+    # 1. missing asset — dangling cross-reference
+    r = run([PY, str(root / "scripts" / "check-asset-refs"), str(dirs["missing-asset"])])
+    results.append(("missing-asset", r.returncode != 0))
+
+    # 2. wrong version — the real guard rejects it against the schema's version pattern.
+    #    Asserting on "version" in the output pins the failure to the planted problem, not to
+    #    some other field the fixture might one day drift on.
+    r = run([PY, str(root / "scripts" / "check-asset-metadata"), str(inputs["wrong-ver"].parent)])
+    results.append(("wrong-version", r.returncode != 0 and "version" in r.stdout))
+
+    # 3. stale context — the real guard flags the fragment's past `expires`
+    r = run([PY, str(root / "scripts" / "check-context-freshness"), str(inputs["stale"])])
+    results.append(("stale-context", r.returncode != 0 and "STALE" in r.stdout))
+
+    # 4. regression decay — regression case whose dependencies no longer resolve
+    r = run([PY, str(root / "scripts" / "check-asset-refs"), str(dirs["regression-decay"])])
+    results.append(("regression-decay", r.returncode != 0))
+
+    # 5. unguarded destructive op — high-risk command not routed through the harness
+    txt = inputs["destructive"].read_text()
+    risky = re.search(r"push\s+--force|reset\s+--hard|rm\s+-rf|branch\s+-D|drop\s+table", txt)
+    guarded = "harness_guard" in txt or "lib/harness.sh" in txt
+    results.append(("destructive-unguarded", bool(risky) and not guarded))
+
+    # 6. empty asset dir — an asset scan with nothing to scan must fail, not report OK.
+    #    This is the vacuous-green class: the other five detect a *wrong* fact, this one detects
+    #    the *absence* of any fact to check, which is how a gutted workspace reads as healthy.
+    r = run([PY, str(root / "scripts" / "check-asset-metadata"), str(dirs["empty-asset-dir"])])
+    results.append(("empty-asset-dir", r.returncode != 0))
+
+    # 7. bundled skill with a dangling regression pointer — the exact gap the PR #3 review found
+    #    on the real bundled skills (#119). Asserting on "does not resolve" pins the failure to
+    #    the planted dangling ref, not to some metadata field the fixture might drift on.
+    r = run([PY, str(root / "scripts" / "check-bundled-skills"), str(dirs["bundled-dangling"])])
+    results.append(("bundled-skill-dangling", r.returncode != 0 and "does not resolve" in r.stdout))
+
+    # 8. bundled-skill scan with nothing to scan — same vacuous-green law as empty-asset-dir,
+    #    applied to the #119 wiring itself (a scan root with no SKILL.md must fail, not pass).
+    r = run([PY, str(root / "scripts" / "check-bundled-skills"), str(dirs["empty-asset-dir"])])
+    results.append(("bundled-skills-empty", r.returncode != 0))
+
+    # 9. A map cannot claim provenance without the repo HEAD it was built from. (A missing
+    #    architecture.md is not a problem: agents use the live graph instead.)
+    with tempfile.TemporaryDirectory() as tmp:
+        map_dir = pathlib.Path(tmp) / "sample"
+        map_dir.mkdir()
+        (map_dir / "README.md").write_text(
+            "---\ntitle: sample\ncategory: maps\nstatus: generated\nlast_reviewed: 2026-09-28\n---\n\n# sample\n")
+        provenance = {"last": {"map-generated": {
+            "at": "2026-09-28T00:00:00Z", "operator": "fixture", "via": "direct",
+            "tool": "fixture", "mode": "full", "repo_head": "fixture",
+        }}}
+        del provenance["last"]["map-generated"]["repo_head"]
+        (map_dir / "provenance.json").write_text(json.dumps(provenance))
+        r = run([PY, str(root / "scripts" / "check-map"), tmp])
+        results.append(("missing-map-head", r.returncode == 1 and "repo_head" in r.stdout))
+
+    print("health self-test (planted-problem detection):")
+    caught = sum(1 for _, d in results if d)
+    for name, detected in results:
+        print(f"  [{'DETECTED' if detected else 'MISSED  '}] {name}")
+    if caught == len(results):
+        print(f"OK: {caught}/{len(results)} planted problems detected")
+        return 0
+    print(f"FAIL: only {caught}/{len(results)} planted problems detected")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(self_test() if "--self-test" in sys.argv[1:] else normal_health())

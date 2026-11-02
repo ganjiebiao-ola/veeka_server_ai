@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Role-aware repo bootstrap for newcomers: clone the right subset of the team's repos.
+
+Zero-dependency (stdlib only), a sibling of check-workspace/check-permissions — same hand-parse
+approach (no PyYAML) since workspace.yaml is a framework-tracked, trusted, but line-oriented file.
+
+Reads `repo_catalog` (org + {id, roles, team} list) from workspace.yaml, clones the repos tagged
+with the requested role(s) and/or team(s) via `gh repo clone` (this workspace already assumes `gh`
+auth — see required_local_permissions), and registers each newly-cloned repo in workspace.local.yaml
+(gitignored — which repos you've mounted is local, per-developer state and is never committed;
+workspace.yaml's own `repositories:` key stays a frozen `[]` placeholder). Never touches an existing
+entry — only adds ones that are missing, so repeated runs (or running two roles back to back) are
+idempotent and never clobber a manually-added mount.
+
+Without `--team`, every repo for the requested role(s) is cloned. `--team <team>` keeps only the
+catalog entries whose `team:` list contains that team. An entry with no `team:` matches no team.
+
+A repo the caller lacks GitHub access to (or that doesn't exist) is skipped with a warning, not a
+hard abort — everything else in the batch still runs, and only what actually cloned gets registered.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import pathlib
+from datetime import datetime, timezone
+
+root = pathlib.Path(__file__).resolve().parent.parent
+ws_file = root / "workspace.yaml"
+local_file = root / "workspace.local.yaml"
+repos_dir = root / "repos"
+
+# 与 scripts/setup-skills 的 is_safe_component 同一约束：id 必须以字母/数字/下划线开头、只能包含
+# 字母数字与 `_.-`，杜绝 `../evil` 之类的值被当成 repos/<id> 的路径分量。
+_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def is_safe_component(value):
+    return bool(value) and bool(_ID_RE.match(value))
+
+
+def usage(exit_code, argv=None):
+    print(__doc__.strip().splitlines()[0])
+    print()
+    print("usage: scripts/setup-repos <role> [<role>...] [--team <team>] | --all [--team <team>] | --list | --list --team <team>")
+    print("  <role>           clone+register every repo in the catalog tagged with this role")
+    print("  --all            clone+register every repo in the catalog")
+    print("  --team <team>    keep only catalog repos whose team: list has this team (repeat or comma-separate)")
+    print("  --list           print the role -> repo mapping and exit (no cloning)")
+    # 用法路径也是一次调用，同样落 run log（与 scripts/ws 顶部"每次调用一行"的承诺一致）。
+    run_log(" ".join(argv or []), exit_code)
+    sys.exit(exit_code)
+
+
+# --- parse repo_catalog: { org, repos: [{id, roles: [...], team: [...]}] } out of workspace.yaml ---
+def parse_repo_catalog(text):
+    lines = text.splitlines()
+    org = None
+    entries = []  # [{"id": ..., "roles": [...], "team": [...]}]
+    in_block = False
+    cur_id = None
+    cur_entry = None
+    for raw in lines:
+        if re.match(r"^repo_catalog:\s*$", raw):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if re.match(r"^[A-Za-z_]", raw):  # next top-level key -> block ends
+            break
+        # 行尾允许写 `# 注释`：与 scripts/setup-skills 的解析保持一致，先截掉 `#` 之后的部分再取值，
+        # 否则 `- id: pa-room  # 注释` 会整行匹配失败、该仓库被静默丢弃。
+        m_org = re.match(r"^\s+org:\s*(.+)$", raw)
+        if m_org:
+            org = m_org.group(1).split("#", 1)[0].strip().strip("\"'")
+            continue
+        m_id = re.match(r"^\s*-\s*id:\s*(.+)$", raw)
+        if m_id:
+            cur_id = m_id.group(1).split("#", 1)[0].strip().strip("\"'")
+            # 校验失败（含被注释/引号剥空，或形如 `../evil` 的非法分量）时不追加 entry，且把
+            # cur_entry 置空，避免后面的 `roles:` 行被错误地写回上一个仓库的记录里。
+            if not is_safe_component(cur_id):
+                cur_id = None
+                cur_entry = None
+                continue
+            cur_entry = {"id": cur_id, "roles": [], "team": []}
+            entries.append(cur_entry)
+            continue
+        # 非贪婪匹配到第一个 `]`，行尾的注释自然被排除在外（同 setup-skills）。
+        m_roles = re.match(r"^\s+roles:\s*\[(.*?)\]", raw)
+        if m_roles and cur_entry is not None:
+            roles = [r.strip() for r in m_roles.group(1).split(",") if r.strip()]
+            cur_entry["roles"] = roles
+            continue
+        # Like roles: an inline list only.
+        m_team = re.match(r"^\s+team:\s*\[(.*?)\]", raw)
+        if m_team and cur_entry is not None:
+            cur_entry["team"] = [t.strip() for t in m_team.group(1).split(",") if t.strip()]
+    return org, entries
+
+
+# --- workspace.local.yaml: this script owns the `repositories:` section; scripts/setup-skills owns
+# an appended `skills:` section (see its SKILLS_BEGIN/END sentinel) that must be left untouched. ---
+def read_local_repos():
+    # 返回 {id: {"id", "path"}}，保序（dict 保持插入顺序）。必须连 `path:` 一起读回来：sidecar 里
+    # 可能有人手工登记了目录名与 id 不同的挂载（见 agent-instructions/mount-points.md、repos/README.md），
+    # 重写时要原样保留，不能一律回退成 repos/<id>。
+    if not local_file.exists():
+        return {}
+    repos = {}
+    cur = None
+    in_block = False
+    for raw in local_file.read_text().splitlines():
+        if re.match(r"^repositories:\s*$", raw):
+            in_block = True
+            continue
+        if in_block and re.match(r"^[A-Za-z_]", raw):  # next top-level key -> block ends
+            in_block = False
+            cur = None
+            continue
+        if not in_block:
+            continue
+        # 与 parse_repo_catalog 保持一致：先截掉 `#` 之后的部分、去掉包裹引号，再取值，否则
+        # `- id: pa-room  # 手工挂载` 这类行内注释会让整行匹配失败，导致该仓库被静默丢弃——
+        # 且由于 cur 未重置，紧随其后的 `path:` 行会被错误地写入上一个仓库的记录里。
+        if re.match(r"^\s*-\s*id:", raw):
+            m = re.match(r"^\s*-\s*id:\s*(.+)$", raw)
+            cand = m.group(1).split("#", 1)[0].strip().strip("\"'") if m else ""
+            if not is_safe_component(cand):
+                cur = None
+                continue
+            cur = cand
+            repos[cur] = {"id": cur, "path": f"repos/{cur}"}
+            continue
+        m_path = re.match(r"^\s+path:\s*(.+)$", raw)
+        if m_path and cur:
+            path_val = m_path.group(1).split("#", 1)[0].strip().strip("\"'")
+            if path_val:
+                repos[cur]["path"] = path_val
+    return repos
+
+
+# scripts/setup-skills extends this same sidecar with its own `skills:` block, fenced by this
+# sentinel pair, so each script can rewrite only the section it owns. Keep this pair identical to
+# the one in scripts/setup-skills if either ever changes.
+_SKILLS_BLOCK_BEGIN = "# >>> setup-skills managed block (skills:) — do not hand-edit >>>"
+_SKILLS_BLOCK_END = "# <<< setup-skills managed block (skills:) <<<"
+
+
+def read_skills_block_tail():
+    # Preserve whatever scripts/setup-skills currently has on disk, verbatim — the fenced form
+    # (sentinel to sentinel), or, from a sidecar written before the sentinel existed, a legacy
+    # unfenced `skills:` block (plus the comment lines directly above it) that runs to EOF. Either
+    # way this script must never touch it; setup-skills reformats a legacy block into fenced form
+    # the next time it runs.
+    if not local_file.exists():
+        return ""
+    text = local_file.read_text()
+    idx = text.find(_SKILLS_BLOCK_BEGIN)
+    if idx != -1:
+        return "\n" + text[idx:].rstrip("\n") + "\n"
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if re.match(r"^skills:\s*$", line):
+            start = i
+            while start > 0 and lines[start - 1].lstrip().startswith("#"):
+                start -= 1
+            return "\n" + "".join(lines[start:]).rstrip("\n") + "\n"
+    return ""
+
+
+def write_local_repositories(repos_by_id, catalog):
+    # 先按 repo_catalog 排序（跨次运行文件稳定、可读），再把只存在于 sidecar、不在 catalog 里的 id
+    # 追加在后面 —— 手工登记的挂载（catalog 里没有的仓库）必须能挺过每一次重写，
+    # 这与本脚本 docstring 里 "never clobber a manually-added mount" 的承诺一致，
+    # 也与 scripts/setup-skills 的 write_local_file 保持同一种做法。
+    catalog_order = [e["id"] for e in catalog]
+    order = catalog_order + [rid for rid in repos_by_id if rid not in catalog_order]
+    ordered_ids = [rid for rid in order if rid in repos_by_id]
+    lines = [
+        "# Local-only: which repos you've actually mounted under repos/ on this machine. Never\n",
+        "# committed (see .gitignore) — managed by `scripts/setup-repos`, not meant to be hand-edited.\n",
+        "repositories:\n",
+    ]
+    for rid in ordered_ids:
+        lines.append(f"  - id: {rid}\n")
+        lines.append(f"    path: {repos_by_id[rid]['path']}\n")
+    # Preserve scripts/setup-skills' `skills:` block verbatim — this script only ever owns
+    # `repositories:`, never the skills sidecar section.
+    lines.append(read_skills_block_tail())
+    # Atomic write: same-dir temp file + os.replace, so an interrupt/exception between read and
+    # write can't truncate this gitignored, unrecoverable-if-lost sidecar.
+    tmp = local_file.with_suffix(local_file.suffix + ".tmp")
+    tmp.write_text("".join(lines))
+    os.replace(tmp, local_file)
+
+
+def _git_out(*args, default=""):
+    # run log 现在也挂在 --list / 缺 gh / usage 这些错误路径上，绝不能让它自己抛异常把命令搞崩：
+    # 无 .git（如刚 `ws init` 出来的工作区）时 git 返回非 0、stdout 为空 → 走 default；
+    # 连 git 都没装时 subprocess 抛 OSError → 同样降级，而不是把栈打到用户脸上。
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True
+        ).stdout.strip()
+    except OSError:
+        return default
+    return out or default
+
+
+def harness_guard(action, target):
+    """把破坏性动作交给 scripts/lib/harness.sh 的 harness_guard 把关，返回是否获批。
+
+    本仓唯一的闸门实现是 shell 函数，这里不另造一套 Python 版，而是 source 同一个文件后调用它 ——
+    确认通道（/dev/tty）、拦截语义、runs/harness-log.jsonl 的记录格式因此天然一致。
+    不捕获 stdout/stderr：提示与判定结果要直接给到终端上的人；harness_guard 自己读写 /dev/tty，
+    不依赖本进程的 stdin，所以没有 tty 时会 fail-safe 拦截（退出码非 0）。
+    HARNESS_ROOT 必须在 source 之前赋值（见 scripts/lib/harness.sh 顶部）。
+    """
+    script = 'HARNESS_ROOT="$1"; . "$1/scripts/lib/harness.sh"; harness_guard "$2" "$3"'
+    try:
+        return subprocess.run(
+            ["sh", "-c", script, "harness", str(root), action, target], cwd=str(root)
+        ).returncode == 0
+    except OSError as exc:  # sh 不可用等极端情况：按未获批处理（fail-safe）
+        print(f"  NOTE: harness unavailable ({exc}) — treating as BLOCKED", file=sys.stderr)
+        return False
+
+
+def run_log(command, exit_code):
+    runs_dir = root / "runs"
+    runs_dir.mkdir(exist_ok=True)
+    sha = _git_out("rev-parse", "HEAD", default="0" * 40)
+    short_sha = _git_out("rev-parse", "--short", "HEAD", default="nogit")
+    operator = _git_out("config", "user.name") or os.environ.get("USER", "unknown")
+    now = datetime.now(timezone.utc)
+    run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{short_sha}"
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 用 json.dumps 序列化：operator（git config user.name）和 command 都可能含 `"` 或 `\`，
+    # 手工拼字符串会写出坏掉的 JSONL 行。
+    line = json.dumps(
+        {
+            "run_id": run_id,
+            "ts": ts,
+            "workspace_sha": sha,
+            "command": f"setup-repos {command}",
+            "exit_code": exit_code,
+            "operator": operator,
+        },
+        ensure_ascii=False,
+    ) + "\n"
+    with open(runs_dir / "run-log.jsonl", "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def index_code_map(repo_ids):
+    """Zero-touch code map: install the MCP tool and build each repo's local graph after cloning.
+
+    Best-effort — the clone already succeeded, so a failure here only prints a note and never
+    changes setup-repos' exit code. `--index-only` keeps knowledge/maps/ untouched: the committed
+    map is refreshed deliberately via `ws map generate`, not by every teammate's clone.
+    """
+    print()
+    print("setting up the code map (codebase-memory-mcp) ...", flush=True)
+    steps = [
+        [sys.executable, str(root / "scripts" / "setup-map-tool")],
+        [sys.executable, str(root / "scripts" / "generate-map"), "--index-only", *repo_ids],
+    ]
+    failed = False
+    for cmd in steps:
+        if subprocess.run(cmd, cwd=root, stdin=subprocess.DEVNULL).returncode != 0:
+            failed = True
+            print(f"  NOTE: code map step failed ({pathlib.Path(cmd[1]).name}) — repos are fine; "
+                  "retry with `ws map install` / `ws map generate --index-only --all`", file=sys.stderr)
+            # Keep going: setup-map-tool also fails when only client registration fails, and the
+            # installed binary can still index. generate-map fails on its own if the binary is missing.
+    if not failed:
+        print("local graph setup completed — reload the session, then check native and subagent access with search_graph")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        usage(0 if argv and argv[0] in ("-h", "--help") else 2, argv)
+
+    text = ws_file.read_text()
+    org, catalog = parse_repo_catalog(text)
+    if not org or not catalog:
+        print("FAIL: no repo_catalog found in workspace.yaml", file=sys.stderr)
+        sys.exit(1)
+
+    all_roles = sorted({r for e in catalog for r in e["roles"]})
+    all_teams = sorted({t for e in catalog for t in e["team"]})
+
+    # Flags can appear in any position, e.g. `backend --team web --list`.
+    team_filter = []
+    remaining_argv = []
+    flag_list = False
+    flag_all = False
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--team":
+            if i + 1 >= len(argv):
+                print("setup-repos: --team requires a value", file=sys.stderr)
+                usage(2, argv)
+            raw_teams = argv[i + 1]
+            for t in raw_teams.split(","):
+                t = t.strip()
+                if t and t not in all_teams:
+                    print(f"setup-repos: unknown team '{t}' (known teams: {', '.join(all_teams)})", file=sys.stderr)
+                    usage(2, argv)
+                if t:
+                    team_filter.append(t)
+            i += 2
+        elif argv[i] == "--list":
+            flag_list = True
+            i += 1
+        elif argv[i] == "--all":
+            flag_all = True
+            i += 1
+        elif argv[i] in ("-h", "--help"):
+            usage(0, argv)
+        else:
+            remaining_argv.append(argv[i])
+            i += 1
+
+    if team_filter:
+        catalog_filtered = [e for e in catalog if any(t in team_filter for t in e["team"])]
+    else:
+        catalog_filtered = catalog
+
+    if flag_list:
+        filtered_roles = sorted({r for e in catalog_filtered for r in e["roles"]})
+        for role in filtered_roles:
+            ids = [e["id"] for e in catalog_filtered if role in e["roles"]]
+            print(f"{role}: {', '.join(ids)}")
+        if team_filter:
+            print(f"\n(filtered by team: {', '.join(team_filter)})")
+        run_log(" ".join(argv), 0)
+        return 0
+
+    if not flag_all and not remaining_argv:
+        usage(2, argv)
+
+    if shutil.which("gh") is None:
+        print("FAIL: `gh` not found — run `gh auth login` first (see required_local_permissions in workspace.yaml)", file=sys.stderr)
+        run_log(" ".join(argv), 1)
+        return 1
+
+    if flag_all:
+        target_ids = [e["id"] for e in catalog_filtered]
+    else:
+        unknown = [r for r in remaining_argv if r not in all_roles]
+        if unknown:
+            print(f"setup-repos: unknown role(s): {', '.join(unknown)} (known roles: {', '.join(all_roles)})", file=sys.stderr)
+            usage(2, argv)
+        target_ids = []
+        for role in remaining_argv:
+            for e in catalog_filtered:
+                if role in e["roles"] and e["id"] not in target_ids:
+                    target_ids.append(e["id"])
+
+    already, registered, failed = [], [], []
+    for rid in target_ids:
+        dest = repos_dir / rid
+        if (dest / ".git").exists():
+            already.append(rid)
+            continue
+        dest_preexisted = dest.exists()
+        print(f"cloning {org}/{rid} ...")
+        try:
+            result = subprocess.run(
+                ["gh", "repo", "clone", f"{org}/{rid}", "--", str(dest)],
+                cwd=root, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            class _Result:
+                returncode = 1
+                stdout = ""
+                stderr = "gh repo clone timed out after 300s (large repo taking too long, or an access prompt with no tty to answer it)"
+            result = _Result()
+        if result.returncode == 0 and (dest / ".git").exists():
+            registered.append(rid)
+        else:
+            if dest.exists():
+                if not dest_preexisted:
+                    # dest 是这次 `gh repo clone` 自己创建后又失败留下的半成品（克隆前不存在）——
+                    # 删自己这次运行刚创建的东西不需要真人确认，否则每次网络抖动导致的克隆失败都会
+                    # 卡在交互确认上，而 setup-repos 本来就是给无 tty 的自动化批量克隆场景用的。
+                    shutil.rmtree(dest, ignore_errors=True)
+                else:
+                    # dest 在克隆之前就已经存在（上一次运行留下的半成品，或目录里有别的内容）——
+                    # 与 scripts/link-skills 的 _rm_path 同一原则：删非本次运行创建的东西必须过
+                    # harness_guard。拦下时不中止整批：只是不清理这一个目录，继续处理其余仓库
+                    # （docstring 承诺的 "everything else in the batch still runs" 不能因为一次
+                    # 确认失败就整体崩掉）。
+                    if harness_guard(f"rm -rf {dest}", str(dest)):
+                        shutil.rmtree(dest, ignore_errors=True)
+                    else:
+                        print(f"  NOTE: left {dest} in place (harness declined cleanup — see runs/harness-log.jsonl)", file=sys.stderr)
+            reason = (result.stderr or result.stdout).strip().splitlines()[-1] if (result.stderr or result.stdout) else "unknown error"
+            print(f"  SKIP: {rid} — {reason}", file=sys.stderr)
+            failed.append(rid)
+
+    present_repos = read_local_repos()
+    to_add = [rid for rid in (already + registered) if rid not in present_repos]
+    if to_add:
+        for rid in to_add:
+            present_repos[rid] = {"id": rid, "path": f"repos/{rid}"}
+        write_local_repositories(present_repos, catalog)
+
+    print()
+    print(f"already present: {', '.join(already) if already else '(none)'}")
+    print(f"newly cloned + registered: {', '.join(registered) if registered else '(none)'}")
+    if failed:
+        print(f"request access to: {', '.join(failed)}")
+
+    if already or registered:
+        index_code_map(already + registered)
+
+    exit_code = 0 if (already or registered) else 1
+    run_log(" ".join(argv), exit_code)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

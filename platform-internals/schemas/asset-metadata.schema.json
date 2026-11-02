@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/olaola-chat/ai-native-workspace-template/platform-internals/schemas/asset-metadata.schema.json",
+  "title": "Workspace asset metadata (v1, #48)",
+  "description": "Machine-readable contract for the YAML frontmatter every reusable workspace asset carries. Delivered by #48; consumed by scripts/check-asset-metadata and (later) the #50 validate/health interface. additionalProperties is true on purpose: this is an overlay on top of a type's own native frontmatter (a skill's agentskills.io name/description, a suite's kind/entry/source), so it validates that the ten shared fields are present and well-formed without rejecting type-specific keys. v0.2 fields (io_contract, compat_range, risk_level, required_capabilities) are named-but-forbidden in v1 and kept out by spec + review, not by this schema.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "id",
+    "type",
+    "owner",
+    "version",
+    "status",
+    "summary",
+    "use_when",
+    "usage",
+    "dependencies",
+    "regression"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable, path-independent asset ID; immutable once active. Form type:slug.",
+      "pattern": "^(instruction|prompt|skill|agent-profile|workflow|spec-module|evaluator|regression-case|tool):[a-z0-9][a-z0-9-]*$"
+    },
+    "type": {
+      "description": "One of the nine asset types.",
+      "enum": [
+        "instruction",
+        "prompt",
+        "skill",
+        "agent-profile",
+        "workflow",
+        "spec-module",
+        "evaluator",
+        "regression-case",
+        "tool"
+      ]
+    },
+    "owner": {
+      "type": "string",
+      "description": "human-id; the accountability convention, not an agent identity.",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "description": "The asset's own lifecycle version: full commit SHA / digest (40 or 64 lowercase hex; display may truncate to 6). Distinct from a suite's source version and an artifact's ws-<sha6>.",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "status": {
+      "description": "Lifecycle state.",
+      "enum": ["draft", "active", "deprecated", "retired", "quarantined"]
+    },
+    "summary": {
+      "type": "string",
+      "description": "One line: what this asset is.",
+      "minLength": 1
+    },
+    "use_when": {
+      "type": "string",
+      "description": "When to use it (the trigger scenario).",
+      "minLength": 1
+    },
+    "usage": {
+      "type": "string",
+      "description": "How to use it (one line + pointer to body/entry).",
+      "minLength": 1
+    },
+    "dependencies": {
+      "type": "array",
+      "description": "IDs of other assets/tools this one depends on. May be empty.",
+      "items": { "type": "string" }
+    },
+    "regression": {
+      "type": "array",
+      "description": "Regression-case ID(s). Non-empty for important assets.",
+      "items": { "type": "string" }
+    },
+    "evaluates": {
+      "type": "string",
+      "description": "Evaluator only: the ID of the asset it grades."
+    },
+    "evaluator": {
+      "type": "string",
+      "description": "A generating capability: the evaluator ID that scores its output."
+    },
+    "reuse_scope": {
+      "description": "Promotion/training annotation only (identify-and-tag; platforms are #38/#34).",
+      "enum": ["team", "promotion-candidate", "training-candidate"]
+    }
+  }
+}

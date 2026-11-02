@@ -1,0 +1,160 @@
+#!/usr/bin/env sh
+# scripts/ws — workspace execution interface (#50): init | validate | test | regression | health | golden | freshness
+#
+# POSIX sh, zero-dependency (git + tar + python3, all standard). The aggregated top-level entry that
+# platform-internals/suites/README.md and workspace.yaml defer to #50. Command names line up with the per-suite
+# run/test convention (#43). Every invocation appends one line to runs/run-log.jsonl
+# (created on first run; format: platform-internals/runs-format.md).
+set -u
+root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PY=python3
+
+_operator() { git -C "$root" config user.name 2>/dev/null || printf '%s' "${USER:-unknown}"; }
+
+# 与 scripts/lib/harness.sh 的 _json_escape 同一实现：命令串和 git config user.name 都可能含 `"`
+# 或 `\`，直接插进 JSON 字面量会写出坏掉的 JSONL 行。
+_json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+_run_log() {   # $1 = command string, $2 = exit code
+  mkdir -p "$root/runs"
+  _rl_id="run-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf nogit)"
+  _rl_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _rl_sha="$(git -C "$root" rev-parse HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')"
+  printf '{"run_id":"%s","ts":"%s","workspace_sha":"%s","command":"ws %s","exit_code":%s,"operator":"%s"}\n' \
+    "$_rl_id" "$_rl_ts" "$_rl_sha" "$(_json_escape "$1")" "$2" "$(_json_escape "$(_operator)")" \
+    >> "$root/runs/run-log.jsonl"
+}
+
+# Suite tests come from two places on purpose: platform-internals/suites/ holds the SUITE contract and the
+# stub that proves the convention, while a real vertical suite mounts at top-level suites/ once one
+# ships (#43). Running only the platform-internals half would make a mounted suite silently untested.
+_suite_tests() {
+  _st_rc=0
+  for _st in "$root"/platform-internals/suites/*/test "$root"/suites/*/test; do
+    [ -x "$_st" ] && { "$_st" || _st_rc=1; }
+  done
+  return $_st_rc
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: ws <command>
+  init <dir>            initialize a compliant workspace into an empty dir (from the HEAD skeleton)
+  validate [<dir>]      structure + workspace.yaml manifest check
+  test                  run each suite's test + platform-internals self-checks
+  regression            asset cross-reference closure + suite tests
+  health [--self-test]  full health check (or self-test the planted-problem detectors)
+  golden [<pack>]       replay a golden sample pack (default: every pack under platform-internals/golden/)
+  freshness             fetch origin and report whether this clone is behind its default branch
+  map install                     install the codebase-memory-mcp tool (scripts/setup-map-tool)
+  map generate <id>|--all         write knowledge/maps/<id>/ (scripts/generate-map)
+  map verify [<dir>]              smoke-test generated map artifacts (scripts/check-map)
+EOF
+  # 用法/未知命令也是一次调用，同样要落 run log —— 顶部注释承诺的是"每一次调用一行"，
+  # 不能因为走的是错误路径就断档。_run_log 里的 git 调用本身已对"无 .git"降级（nogit / 全 0 sha），
+  # 所以哪怕在 `ws init` 出来的、还没 git init 的新工作区里调用也不会反过来把脚本搞崩。
+  _run_log "${cmd:-} ${args:-}" 2
+  exit 2
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+args="$*"          # captured before any branch shifts, so the run log records what was actually run
+rc=0
+
+case "$cmd" in
+  init)
+    dest="${1:-}"
+    # 这两条守卫同样要落 run log（同 usage()）：拒绝执行也是一次有记录的调用。
+    [ -n "$dest" ] || { echo "usage: ws init <dir>" >&2; _run_log "$cmd $args" 2; exit 2; }
+    if [ -e "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+      echo "ws init: '$dest' exists and is not empty (refusing to clobber)" >&2
+      _run_log "$cmd $args" 1; exit 1
+    fi
+    mkdir -p "$dest"
+    if ( cd "$root" && git archive HEAD ) | ( cd "$dest" && tar -x ); then
+      echo "OK: initialized workspace at $dest (from HEAD skeleton)"
+    else
+      echo "FAIL: init" >&2; rc=1
+    fi
+    ;;
+  validate)
+    "$PY" "$root/scripts/check-workspace" "$@" || rc=$?
+    ;;
+  test)
+    _suite_tests || rc=1
+    # golden packs contribute their read-only half only: verify checks the tracked record closes.
+    # replay writes only inside its own pack dir (.origin/.mount, gitignored) and stays out of the
+    # main green line (see platform-internals/golden/README.md).
+    for v in "$root"/platform-internals/golden/*/verify; do [ -x "$v" ] && { "$v" || rc=1; }; done
+    "$PY" "$root/scripts/check-generated"     || rc=1
+    "$PY" "$root/platform-internals/tests/test_secret_scan.py" || rc=1
+    "$PY" "$root/platform-internals/tests/test_code_map.py" || rc=1
+    "$PY" "$root/platform-internals/tests/test_repo_tooling.py" || rc=1
+    "$PY" "$root/platform-internals/tests/test_freshness.py" || rc=1
+    # The sync mechanism is framework-owned, so its regression (a synthetic two-round upstream sync with the
+    # real check-ownership / upstream-pin) runs in the framework green line, not only before a sync.
+    sh "$root/skills/workspace-upstream-sync/regression/smoke.sh" "$root" || rc=1
+    "$PY" "$root/scripts/check-asset-metadata" || rc=1
+    [ "$rc" = 0 ] && echo "OK: test passed" || echo "FAIL: test"
+    ;;
+  regression)
+    "$PY" "$root/scripts/check-asset-refs" || rc=1
+    _suite_tests || rc=1
+    [ "$rc" = 0 ] && echo "OK: regression passed" || echo "FAIL: regression"
+    ;;
+  health)
+    "$PY" "$root/scripts/check-health" "$@" || rc=$?
+    ;;
+  freshness)
+    # Exit 0 up to date, 1 behind, 2 error or failed fetch (state unknown). Kept out of `health`: health stays offline.
+    "$PY" "$root/scripts/check-freshness" "$@" || rc=$?
+    ;;
+  map)
+    sub="${1:-}"
+    case "$sub" in
+      install)
+        shift; "$PY" "$root/scripts/setup-map-tool" "$@" || rc=$?
+        ;;
+      generate)
+        shift; "$PY" "$root/scripts/generate-map" "$@" || rc=$?
+        ;;
+      verify)
+        shift; "$PY" "$root/scripts/check-map" "$@" || rc=$?
+        ;;
+      *)
+        echo "usage: ws map install | generate <id>|--all [--mode fast|moderate|full] | verify [<dir>]" >&2
+        rc=2
+        ;;
+    esac
+    ;;
+  golden)
+    pack="${1:-}"
+    if [ -n "$pack" ]; then
+      shift
+      if [ -x "$root/platform-internals/golden/$pack/replay" ]; then
+        "$root/platform-internals/golden/$pack/replay" "$@" || rc=$?
+      else
+        echo "ws golden: no pack at platform-internals/golden/$pack/replay" >&2; rc=2
+      fi
+    else
+      found=0
+      for r in "$root"/platform-internals/golden/*/replay; do
+        [ -x "$r" ] || continue
+        found=1
+        "$r" || rc=1
+      done
+      [ "$found" = 1 ] || { echo "OK: no golden sample pack present (nothing to replay)"; }
+    fi
+    ;;
+  "" | -h | --help)
+    usage
+    ;;
+  *)
+    echo "ws: unknown command '$cmd'" >&2
+    usage
+    ;;
+esac
+
+_run_log "$cmd $args" "$rc"
+exit "$rc"

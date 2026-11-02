@@ -1,0 +1,220 @@
+#!/usr/bin/env sh
+# platform-internals/golden/campaign-validator/replay — re-run the recorded requirement-to-acceptance loop (#44).
+#
+# Deterministic and zero-dependency (POSIX sh + git + python3). Three moves:
+#   1. materialize the tracked seed/ into a real git repo at <pack>/.origin/ (4 commits, 4 tags);
+#   2. `git clone` that into <pack>/.mount/ — clone, not copy, so .git provenance is real;
+#   3. walk the recorded stages, ASSERTING each planted failure occurs and each recorded fix clears it.
+#
+# Everything the replay generates stays INSIDE this pack's directory (both gitignored) — repos/ is
+# reserved for real business mounts and never receives training material.
+#
+# It never deletes: re-running resets the work branch back to the first tag. That is what keeps the
+# main path free of any destructive action, so it needs no controlling terminal and runs the same
+# under CI or an agent as it does under a person. `--clean` is the one destructive path and is gated
+# by harness_guard (agent-instructions/security-defaults.md §2).
+#
+# usage: replay [--clean]
+set -u
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+pack=$(basename "$here")
+root=$(CDPATH= cd -- "$here/../../.." && pwd)   # pack -> platform-internals/golden -> platform-internals -> workspace root
+repo="$here/.mount"
+origin="$here/.origin"
+packdir="platform-internals/golden/$pack"       # repo-relative, for messages and the harness action
+logdir="$root/runs/golden/$pack"
+
+# HARNESS_ROOT 必须在 source 之前设好：harness.sh 在 POSIX sh 下拿不到自己的路径，
+# 由 source 点把已算好的工作区根传下去，日志才不会跟着 CWD 跑（见 scripts/lib/harness.sh 顶部）。
+HARNESS_ROOT="$root"
+. "$root/scripts/lib/harness.sh"
+
+# Fixed identity and timestamps: the same seed must produce the same history on every machine.
+FIXED_DATE="2026-07-29T00:00:00Z"
+GIT_ID='-c user.name=golden-pack -c user.email=golden-pack@example.invalid'
+LAST_TAG=s4-v2-done
+
+# Run record (#50): one line per replay, same JSONL shape as runs/run-log.jsonl. `ws golden` logs the
+# invocation; this logs the replay itself, so a direct run leaves a trace too. Written from an EXIT
+# trap so a failed replay is recorded as loudly as a successful one.
+_replay_rc=1
+_replay_logged=0
+_replay_log() {
+  [ "$_replay_logged" = 0 ] || return 0
+  _replay_logged=1
+  mkdir -p "$logdir"
+  printf '{"run_id":"replay-%s-%s","ts":"%s","workspace_sha":"%s","pack":"%s","stages":9,"planted_failures":2,"exit_code":%s,"operator":"%s"}\n' \
+    "$(date -u +%Y%m%dT%H%M%SZ)" "$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf nogit)" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(git -C "$root" rev-parse HEAD 2>/dev/null || printf '0000000000000000000000000000000000000000')" \
+    "$pack" "$_replay_rc" \
+    "$(git -C "$root" config user.name 2>/dev/null || printf '%s' "${USER:-unknown}")" \
+    >> "$logdir/replay-log.jsonl"
+}
+
+tmp=$(mktemp) || exit 2
+trap 'rm -f "$tmp"; _replay_log' EXIT
+
+_say()  { printf '%s\n' "$*"; }
+_step() { printf '\n[stage %s] %s\n' "$1" "$2"; }
+
+# _expect <want-exit> <label> <cmd...> — assert, don't hope. A pack that stopped teaching its lesson
+# must fail loudly rather than quietly replay a happy path.
+_expect() {
+  _e_want=$1; _e_label=$2
+  shift 2
+  "$@" > "$tmp" 2>&1
+  _e_got=$?
+  if [ "$_e_got" = "$_e_want" ]; then
+    printf '  [ok]   %s (exit %s as expected)\n' "$_e_label" "$_e_got"
+    return 0
+  fi
+  printf '  [FAIL] %s: expected exit %s, got %s\n' "$_e_label" "$_e_want" "$_e_got"
+  sed 's/^/         /' "$tmp"
+  printf '\nFAIL: golden pack %s — the recorded loop no longer reproduces\n' "$pack"
+  exit 1
+}
+
+_git_origin() { git $GIT_ID -C "$origin" "$@"; }
+
+# _commit_step <src-dir> <tag> <message> — overlay a recorded variant and commit it as one step.
+_commit_step() {
+  cp -R "$1/." "$origin/" || exit 1
+  _git_origin add -A || exit 1
+  GIT_AUTHOR_DATE="$FIXED_DATE" GIT_COMMITTER_DATE="$FIXED_DATE" \
+    _git_origin commit -q -m "$3" || exit 1
+  _git_origin tag -f "$2" >/dev/null 2>&1 || exit 1
+}
+
+# ---------------------------------------------------------------- --clean (the one destructive path)
+
+if [ "${1:-}" = "--clean" ]; then
+  _replay_logged=1                     # the harness records this run; not a replay
+  if [ ! -e "$repo" ] && [ ! -e "$origin" ]; then
+    _say "OK: nothing to clean (golden pack $pack is not materialized)"
+    exit 0
+  fi
+  if ! harness_guard "rm -rf $packdir/.mount $packdir/.origin" "$pack"; then
+    _say "clean: BLOCKED by the harness — expected whenever there is no controlling terminal."
+    _say "       The block is recorded in runs/harness-log.jsonl (run id, decision, channel)."
+    exit 1
+  fi
+  rm -rf "$repo" "$origin"
+  _say "OK: golden pack $pack cleaned ($packdir/.mount and $packdir/.origin removed)"
+  exit 0
+fi
+
+if [ "$#" -gt 0 ]; then
+  _replay_logged=1
+  _say "usage: replay [--clean]" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------- stage 0a: materialize the upstream
+
+_step 0a "materialize the tracked seed into a git repo standing in for upstream"
+if [ -d "$origin/.git" ] && _git_origin rev-parse "$LAST_TAG" >/dev/null 2>&1; then
+  _say "  reusing $packdir/.origin (all recorded steps present)"
+elif [ -e "$origin" ]; then
+  _say "  FAIL: $packdir/.origin exists but is incomplete." >&2
+  _say "        Refusing to rebuild over it — run 'replay --clean' first." >&2
+  exit 1
+else
+  mkdir -p "$origin"
+  git init -q -b main "$origin" 2>/dev/null || {
+    git init -q "$origin" && git -C "$origin" symbolic-ref HEAD refs/heads/main
+  }
+  _commit_step "$here/seed"                        s1-initial   "step 01: v1 validator and the first three cases"
+  _commit_step "$here/execution/steps/02-fix-ac2"  s2-fixed     "step 02: AC-2 lower bound is exclusive"
+  _commit_step "$here/execution/steps/03-v2-cases" s3-v2-cases  "step 03: REQ-001 v2 cases land before the code"
+  _commit_step "$here/execution/steps/04-impl-v2"  s4-v2-done   "step 04: implement the v2 criteria"
+  _say "  built 4 commits / 4 tags from seed/ and execution/steps/"
+fi
+
+# ---------------------------------------------------------------- stage 0b: mount it (clone, not copy)
+
+_step 0b "clone it into the pack's own .mount/ — git clone, so the framework reads real .git provenance"
+if [ -d "$repo/.git" ]; then
+  have=$(git -C "$repo" remote get-url origin 2>/dev/null || printf '')
+  case "$have" in
+    */"$pack"/.origin)
+      _say "  reusing $packdir/.mount (its origin is this pack's upstream)" ;;
+    *)
+      _say "  FAIL: $packdir/.mount exists but its origin is '$have'." >&2
+      _say "        That is not this pack's mount — refusing to touch it." >&2
+      exit 1 ;;
+  esac
+elif [ -e "$repo" ]; then
+  _say "  FAIL: $packdir/.mount exists and is not a git repository — refusing to clobber it." >&2
+  exit 1
+else
+  git clone -q "$origin" "$repo" || exit 1
+  _say "  cloned into $packdir/.mount"
+fi
+git -C "$repo" fetch -q --tags origin 2>/dev/null || true
+git -C "$repo" checkout -q -f -B work s1-initial || exit 1
+_say "  work branch reset to s1-initial (nothing deleted; re-running is safe)"
+
+# ---------------------------------------------------------------- stages 1-9: walk the recorded loop
+
+_step 1 "structured requirement (REQ-001 v1)"
+_say "  read: requirement/REQ-001-campaign-config-validation.md — AC-1, AC-2 at v1"
+_say "        context read-order comes from team-context/manifest.yaml, not a repo scan"
+
+_step 2 "task breakdown"
+_say "  read: breakdown/TASKS.md — T-1..T-3, each pointing back at an AC"
+
+_step 3 "PLANTED FAILURE PF-1 — the suite must be RED here"
+_expect 1 "AC-2 zero-discount case fails" "$repo/test"
+_say "        investigation: test/TEST-REPORT-01-ac2-red-to-green.md"
+
+_step 4 "apply the recorded fix (git merge --ff-only s2-fixed)"
+git -C "$repo" merge -q --ff-only s2-fixed || exit 1
+git -C "$repo" --no-pager show --stat --oneline -s s2-fixed | sed 's/^/  /'
+_expect 0 "suite is GREEN after the recorded fix" "$repo/test"
+
+_step 5 "acceptance round 1 (REQ-001 v1)"
+_say "  read: acceptance/ACCEPTANCE.md §Round 1 — AC-1, AC-2 accepted at v1"
+
+_step 6 "requirement change: REQ-001 v1 -> v2"
+_say "  read: requirement/REQ-001-changelog.md — AC-2 cap 80->60, AC-3 added, with the why"
+_say "        written back in five places: requirement, breakdown, exec log, test report, acceptance"
+
+_step 7 "PLANTED FAILURE PF-2 — cases land before code, so the suite must be RED again"
+git -C "$repo" merge -q --ff-only s3-v2-cases || exit 1
+_expect 1 "v2 criteria are not implemented yet" "$repo/test"
+_say "        investigation: test/TEST-REPORT-02-v2-red-to-green.md"
+
+_step 8 "implement v2 (git merge --ff-only s4-v2-done)"
+git -C "$repo" merge -q --ff-only s4-v2-done || exit 1
+git -C "$repo" --no-pager show --stat --oneline -s s4-v2-done | sed 's/^/  /'
+_expect 0 "suite is GREEN at v2 (all three criteria)" "$repo/test"
+
+_step 9 "acceptance round 2 — verify the record closes over the requirement"
+if ! "$here/verify" > "$tmp" 2>&1; then
+  sed 's/^/  /' "$tmp"
+  printf '\nFAIL: golden pack %s — the acceptance record no longer closes\n' "$pack"
+  exit 1
+fi
+sed 's/^/  /' "$tmp"
+
+# ---------------------------------------------------------------- tail
+
+cat <<EOF
+
+With a REAL business repo, the next move would be quick start step 3 — clone it under repos/ and
+register it in workspace.local.yaml (gitignored, local to your machine):
+
+repositories:
+  - id: YOUR_REPO
+    path: repos/YOUR_REPO
+
+This toy repo is deliberately NOT registered: it lives inside the pack ($packdir/.mount), and
+repos/ + workspace.local.yaml stay reserved for real business mounts (workspace.yaml's own
+repositories: key is a frozen [] placeholder — see workspace.yaml itself).
+
+EOF
+
+_replay_rc=0
+_say "OK: golden pack $pack replayed (5 stages, 2 planted failures handled)"

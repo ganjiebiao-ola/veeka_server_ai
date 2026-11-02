@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+.runtime
+**/node_modules
+**/__pycache__
+**/*.log
+frontend/dist
+backend/data
+backend/workspace
+# Runs get the current repo notes from the backend, not a copy as old as the image.
+skill/ola-security-audit/targets

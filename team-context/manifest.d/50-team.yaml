@@ -1,0 +1,13 @@
+# team-context/manifest.d/50-team.yaml — this team's Context Manifest rows (team-owned seed; merged after 00-template.yaml).
+# Same shape as 00-template.yaml. Rows are additive: add concrete rows under an existing task type (e.g. one
+# `team-context/mounted-repos/<id>.md` + `knowledge/maps/<id>/` pair per mounted repo) or declare a new task
+# type. A task type's `when:` is set by whichever fragment declares it first; the same path twice under one
+# task type is an error. Re-render after editing: scripts/render-context-manifest.
+version: 1
+
+task_types:
+  # Concrete rows for the repos mounted under repos/ — fill when you mount a repo (workspace-context-bootstrap writes them).
+  mounted-repo-work:
+    read:
+      # - { path: team-context/mounted-repos/<id>.md, authority: trusted, last_reviewed: YYYY-MM-DD }
+      # - { path: knowledge/maps/<id>/,               authority: data,    last_reviewed: YYYY-MM-DD, optional: true }

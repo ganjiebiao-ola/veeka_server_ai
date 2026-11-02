@@ -1,0 +1,117 @@
+# Team AI-Workspace declaration (human-readable first)
+# A lightweight note: who is accountable, which business repos are mounted.
+# The execution-interface ticket #50 has landed: `scripts/ws validate` machine-checks this file
+# against platform-internals/schemas/workspace.schema.json.
+
+owner: EricZhang                 # human owner (people are accountable; no agent identity)
+team: Infra/AI
+
+# Business repos mounted under repos/ (git clone in; framework read-only, non-locking).
+# This key is a frozen placeholder — `repositories` is schema-required so it must stay present, but
+# its value is never edited/committed again. The real, local list of what you've mounted lives in
+# workspace.local.yaml (gitignored), managed by `scripts/setup-repos`.
+repositories: []
+
+# Catalog of the team's real repos on GitHub, tagged by role (backend/frontend/client). Source of
+# truth for `scripts/setup-repos <role>`, which clones+registers the right subset under `repos/` for
+# a newcomer. A repo can list more than one role if it's ever shared across roles.
+# Optional `team:` tags a repo with the team(s) that own it, for `scripts/setup-repos --team <team>`.
+# Parsing limitation: `roles:` and `team:` must stay inline-list form (`[a, b]`). The zero-dependency
+# hand-parser in scripts/setup-repos only reads inline lists, so a block-list form silently yields an
+# empty list.
+repo_catalog:
+  org: <github-org>
+  repos: []
+  # Example — replace the `repos: []` line above with:
+  #   - id: <repo-name>
+  #     roles: [backend]
+  #     team: [<team>]
+
+# Optional: curated, always-mounted skills selected from inside a skills-source monorepo checkout
+# (agent-instructions/mount-points.md § "Mounting at scale"); source of truth for `scripts/setup-skills`.
+# skill_catalog:
+#   source: <repo_catalog id with role skills-source>
+#   skills: []
+
+# Mounted vertical Agent suites. Registration convention: platform-internals/suites/README.md (#43).
+# The field slot & schema validation belong to #41/#50; this is how #43 says to fill it.
+agent_suites:
+  - id: sre-autofix
+    source: oc-ai-pf/ola-sre-agent
+    version: "558e3866b00b2607740ba0c35bd49559c4f12b92"   # upstream HEAD the contract was ported from (humans show 558e38)
+    entry: suites/sre-autofix/
+  # sre-inspect (#146): the upstream inspection half in local form — Grafana-native alert intake →
+  # INSPECT.md brief → the workspace's own agent investigates on the department Grafana data plane →
+  # report.json v1.1 that suites/sre-autofix consumes. Reference implementation stays in ola-sre-agent.
+  - id: sre-inspect
+    source: oc-ai-pf/ola-sre-agent
+    version: "9e83219ae2c7d76c80b16e5a7adbb1fb122661da"   # reference HEAD the contracts were ported from (humans show 9e8321)
+    entry: suites/sre-inspect/
+  # security-patch (#9): the operator contract for the codesec tool — scan → Pick (human) → batch PRs,
+  # with one GitHub issue per bug type as the state. The template tracks the app and agent instructions together.
+  - id: security-patch
+    source: olaola-chat/ai-native-workspace-template
+    version: "ce763fbb48efd647335cab19ee25cfe12ef3138e"   # template source version, import provenance is in SUITE.md
+    entry: suites/security-patch/
+
+# Local permissions this workspace's capabilities need (reuse the operator's existing permissions; no credential in the repo)
+# Structured as {mechanism, check, guide} so `scripts/check-permissions` prechecks each one (#50).
+# A `check` containing TODO is treated as "not configured" (guidance printed, not run). Plain-string
+# entries are still accepted (back-compat) but skipped by the precheck.
+required_local_permissions:
+  - mechanism: gh-cli
+    check: gh auth status
+    guide: "Run `gh auth login` to authenticate the GitHub CLI."
+  - mechanism: ip-allowlist
+    check: "TODO(owner): a connectivity probe to an internal host, e.g. curl -sfI https://<internal-host>"
+    guide: "Connect to the office network / VPN so your IP is on the allowlist; TODO(owner) name the host."
+  - mechanism: ccusage
+    check: "TODO(optional): command -v ccusage — preferred base-usage/cost source for the token-usage-analysis skill"
+    guide: "Optional: `npm i -g ccusage@20` (MIT; only evaluated major: v20) — preferred base-usage + USD-cost source for token-usage-analysis. Install explicitly; the script never auto-downloads it and falls back to the built-in collector when absent."
+  - mechanism: python3
+    check: "python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)'"
+    guide: "python3 >= 3.8 is required by scripts/ws and suites/sre-autofix/lib."
+  - mechanism: docker
+    check: "TODO(optional): command -v docker — suites/sre-inspect runs grafana/mcp-grafana (Prometheus/alert-rule tools for Claude Code/Codex) and the optional local HolmesGPT as containers"
+    guide: "Optional: install Docker. Without it suites/sre-inspect still works for logs (SLS via Grafana) and alert intake; metrics tools and local Holmes need the container."
+  - mechanism: agent-cli
+    check: "command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1"
+    guide: "suites/sre-autofix runs the fix with your own agent CLI: install Claude Code (`claude`) or Codex (`codex`) and log in. Interactive use works without it."
+
+# Known limitations (must-read before handoff and re-runs)
+known_limitations:
+  - >-
+    Under Codex, starting an agent from inside a mounted business repo (repos/<repo>/) detaches it
+    from the workspace: a business repo is its own git root, so the root AGENTS.md and its security
+    defaults are not in Codex's discovery chain. Run agents from the workspace root. Mitigation:
+    the workspace-context-bootstrap optional step writes or patches a mounted repo's own agent
+    entries with the canonical security block (source-pinned by blob SHA), so a detached session
+    still carries the defaults; scripts/check-repo-agent-entries detects missing or stale copies
+    (see agent-instructions/claude-md-hierarchy.md section 2).
+  - >-
+    suites/sre-autofix executes the fix through the operator's own agent CLI in a git worktree of
+    repos/<id> (runs/sre-autofix/<id>/worktree) — no sandbox beyond the operator's own permissions;
+    its gate is hygiene-only (no CI replication, no regression); push + PR are human-gated by
+    harness_guard and need a real terminal; the codesec container executor is documented
+    (suites/sre-autofix/docs/codesec-interface.md) but not wired.
+  - >-
+    suites/sre-inspect is the LOCAL form of the SRE inspection leg: no unattended service, no Slack
+    collector, no scheduling, no post-deploy sweeps, no cross-incident memory beyond the fingerprint
+    ledger — the human picks candidates from `run intake` and the agent investigates one at a time.
+    Its data plane is the department Grafana only (one service-account token); SLS index facts must
+    be shipped as offline snapshot skills, the SLS plugin has no context-logs API (synthesised), and
+    when Grafana is down the whole data plane is down.
+  - >-
+    suites/security-patch includes its app under app/. Use run start from the workspace root.
+    The app clones the repo, fixes, checks and opens PRs in containers with the operator's GitHub login.
+    The suite keeps the human Pick and PR review gates. Its check step
+    runs only the tests that pass offline on the base commit, so DB and Redis tests stay manual.
+
+# Upstream template this workspace was instantiated from (ownership classes: platform-internals/ownership.yaml).
+# Absent in the template itself. In a team workspace, uncomment and fill once; scripts/upstream-pin bumps
+# synced_commit on every sync and scripts/check-ownership (ws health) fails while a framework-owned path
+# differs from that commit — the guard behind "generic change → upstream first, then sync".
+# upstream:
+#   url: https://github.com/olaola-chat/ai-native-workspace-template.git
+#   branch: main
+#   synced_commit: <full 40-hex sha of the upstream commit last merged in>

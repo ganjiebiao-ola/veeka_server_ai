@@ -1,0 +1,67 @@
+#!/usr/bin/env sh
+# Ship step for skills/workspace-upstream-sync: push a synced branch and open its PR, both gated
+# behind harness_guard (security-defaults.md §2) — this script is the ONLY place in that skill's
+# workflow allowed to touch `git push` or `gh pr create`; the skill body itself must never call them
+# directly (same discipline as suites/sre-autofix/lib/ship.py).
+#
+# Usage: scripts/sync-upstream-ship <branch> <base> <title-file> <body-file>
+#   <branch>     the synced branch to push (e.g. sync-upstream-main)
+#   <base>       PR base branch (e.g. main)
+#   <title-file> path to a file holding the PR title (avoids shell-quoting Chinese content)
+#   <body-file>  path to a file holding the PR body
+#
+# Known environment gotcha (see skills/workspace-upstream-sync/SKILL.md): both `git push` to a
+# remote and any `gh` call may need this session's sandbox disabled — SSH-over-proxy and TLS
+# interception otherwise fail with "Operation not permitted" / certificate errors that look like
+# real bugs but aren't.
+#
+# Known `gh` gotcha: this workspace has two remotes (`origin` = the team's fork, `upstream` = the
+# template). `gh`'s own repo-inference can silently resolve to the WRONG one. This script always
+# derives --repo from `git remote get-url origin` itself, never from `gh repo view`.
+set -e
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+branch="${1:?usage: sync-upstream-ship <branch> <base> <title-file> <body-file>}"
+base="${2:?usage: sync-upstream-ship <branch> <base> <title-file> <body-file>}"
+title_file="${3:?usage: sync-upstream-ship <branch> <base> <title-file> <body-file>}"
+body_file="${4:?usage: sync-upstream-ship <branch> <base> <title-file> <body-file>}"
+
+[ -f "$title_file" ] || { echo "FAIL: title file not found: $title_file" >&2; exit 1; }
+[ -f "$body_file" ] || { echo "FAIL: body file not found: $body_file" >&2; exit 1; }
+git rev-parse --verify "$branch" >/dev/null 2>&1 || { echo "FAIL: branch does not exist locally: $branch" >&2; exit 1; }
+
+HARNESS_ROOT="$root"
+. "$root/scripts/lib/harness.sh"
+
+# Refuse to force-push. The merge-based workflow this script backs should never need one — if the
+# remote has diverged, that's a real conflict (someone else pushed, or this branch was rebased
+# somewhere) that needs a human to look at, not a script guessing which side wins.
+if git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+  if ! git merge-base --is-ancestor "origin/$branch" "$branch"; then
+    echo "FAIL: origin/$branch is not an ancestor of local $branch — a force-push would be needed." >&2
+    echo "      This script never force-pushes; resolve the divergence by hand first." >&2
+    exit 1
+  fi
+fi
+
+if ! harness_guard "git push" "origin/$branch"; then
+  echo "sync-upstream-ship: BLOCKED at push — $branch left unpushed (see runs/harness-log.jsonl)" >&2
+  exit 1
+fi
+git push origin "$branch"
+
+# Parse owner/repo out of the origin remote URL — handles both
+# git@github.com:owner/repo.git and https://github.com/owner/repo(.git) forms.
+origin_url=$(git remote get-url origin)
+repo_slug=$(printf '%s\n' "$origin_url" \
+  | sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##')
+[ -n "$repo_slug" ] || { echo "FAIL: could not parse owner/repo from origin URL: $origin_url" >&2; exit 1; }
+
+pr_target="$repo_slug#$base...$branch"
+if ! harness_guard "gh pr create" "$pr_target"; then
+  echo "sync-upstream-ship: BLOCKED at PR create — push already landed, open the PR by hand: $pr_target (see runs/harness-log.jsonl)" >&2
+  exit 1
+fi
+gh pr create --repo "$repo_slug" --base "$base" --head "$branch" \
+  --title "$(cat "$title_file")" --body-file "$body_file"

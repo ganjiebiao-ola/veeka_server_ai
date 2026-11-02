@@ -1,0 +1,25 @@
+{
+  "daily": [
+    {
+      "period": "2026-08-10",
+      "inputTokens": 400,
+      "outputTokens": 300,
+      "cacheReadTokens": 1010,
+      "cacheCreationTokens": 5,
+      "totalCost": 2.5,
+      "agents": [
+        {
+          "agent": "claude",
+          "inputTokens": 400,
+          "outputTokens": 300,
+          "cacheReadTokens": 1010,
+          "cacheCreationTokens": 5,
+          "modelBreakdowns": [
+            {"modelName": "claude-fable-5", "inputTokens": 400, "outputTokens": 300, "cost": 2.5}
+          ]
+        }
+      ]
+    }
+  ],
+  "totals": {"inputTokens": 400, "outputTokens": 300, "cacheReadTokens": 1010, "cacheCreationTokens": 5, "totalCost": 2.5}
+}

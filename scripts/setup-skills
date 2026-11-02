@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Curated-allowlist mounter for skills that live inside a skills-source monorepo (skill_catalog.source).
+
+Zero-dependency (stdlib only), a structural sibling of scripts/setup-repos: same hand-parse
+approach (no PyYAML), same idempotent register-into-a-sidecar pattern. Where setup-repos clones a
+whole business repo, this script *selects* individual skills out of an already-cloned monorepo
+(repos/<skill_catalog.source>, see workspace.yaml) and symlinks each selected leaf dir into
+skills/<id> — the mount point both Claude Code and Codex discover via the tracked
+.claude/skills -> ../skills and .agents/skills -> ../skills symlinks.
+
+This script only *selects and links* — it never clones. Run `scripts/setup-repos <role-of-the-
+skill-source>` first (e.g. `scripts/setup-repos skills-source`) so repos/<source>/.git exists.
+
+Reads `skill_catalog` ({source, skills: [{id, category, roles}]}) from workspace.yaml. For each
+selected id, symlinks repos/<source>/<category>/<id> -> skills/<id> and registers it in
+workspace.local.yaml's `skills:` list (gitignored — local, per-developer state, same treatment as
+`repositories:`). Never touches a skills/<id> entry it didn't itself create (e.g. the three
+template-bundled skills, or anything a person mounted by hand) — idempotency and safety both follow
+from "only ever touch what you yourself registered," the same invariant setup-repos relies on.
+
+The `skills:` block is fenced with a stable sentinel (SKILLS_BEGIN/SKILLS_END below) so this script
+and setup-repos can each rewrite their own half of the shared sidecar without clobbering the other's
+— splicing keys off the sentinel line, never off prose that might get edited.
+
+Every symlink is tagged `mode: curated` in the sidecar. The on-demand loader skill
+(skills/skills-source-loader) finds a long-tail skill with `scripts/setup-skills --index` (a live scan of
+repos/<source>/<category>/<id>/SKILL.md — no index file has to be kept up to date inside the source repo)
+and uses `scripts/setup-skills --id <id> --category <category>` to mount a
+single long-tail skill as `mode: trial` instead — see agent-instructions/mount-points.md for the
+curated/trial governance split and the promotion path (re-add the id to workspace.yaml's
+skill_catalog, re-run this script; an already-linked id flips mode from trial to curated in place
+rather than re-linking).
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import pathlib
+from datetime import datetime, timezone
+
+root = pathlib.Path(__file__).resolve().parent.parent
+ws_file = root / "workspace.yaml"
+local_file = root / "workspace.local.yaml"
+skills_dir = root / "skills"
+
+SKILLS_BEGIN = "# >>> setup-skills managed block (skills:) — do not hand-edit >>>"
+SKILLS_END = "# <<< setup-skills managed block (skills:) <<<"
+
+_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def usage(exit_code):
+    print(__doc__.strip().splitlines()[0])
+    print()
+    print("usage: scripts/setup-skills <role> [<role>...] | --all | --list | --index | --id <id> [--category <category>]")
+    print("  <role>     symlink every curated skill tagged with this role into skills/")
+    print("  --all      symlink every curated skill in skill_catalog")
+    print("  --list     print the role -> skill mapping and exit (no linking, no clone required)")
+    print("  --index    print every skill in the source repo: <category>/<id> [status] — description")
+    print("             (live scan, read-only; needs the source repo cloned)")
+    print("  --id <id> [--category <category>]")
+    print("             symlink exactly one id — from skill_catalog if already curated (a --category")
+    print("             other than the catalog's is refused), else --category is required and the")
+    print("             mount is registered as mode: trial")
+    print("             (this is the primitive skills/skills-source-loader uses for on-demand mounts)")
+    sys.exit(exit_code)
+
+
+def is_safe_component(value):
+    # Must start with an alphanumeric/underscore (so a leading `.` or `-` is already rejected here,
+    # not just by the containment check below) and contain no path separators anywhere. This gates
+    # both catalog-authored and (more importantly) agent-supplied --id/--category values, since the
+    # latter can originate from reading mount-point content (untrusted data, never instruction).
+    return bool(value) and bool(_ID_RE.match(value))
+
+
+# --- parse skill_catalog: { source, skills: [{id, category, roles: [...]}] } out of workspace.yaml ---
+def parse_skill_catalog(text):
+    lines = text.splitlines()
+    source = None
+    entries = []  # [{"id": ..., "category": ..., "roles": [...]}]
+    in_block = False
+    for raw in lines:
+        if re.match(r"^skill_catalog:\s*$", raw):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if re.match(r"^[A-Za-z_]", raw):  # next top-level key -> block ends
+            break
+        m_source = re.match(r"^\s+source:\s*(.+)$", raw)
+        if m_source:
+            source = m_source.group(1).split("#", 1)[0].strip().strip("\"'")
+            continue
+        m_id = re.match(r"^\s*-\s*id:\s*(.+)$", raw)
+        if m_id:
+            entries.append({"id": m_id.group(1).split("#", 1)[0].strip(), "category": None, "roles": []})
+            continue
+        m_category = re.match(r"^\s+category:\s*(.+)$", raw)
+        if m_category and entries:
+            entries[-1]["category"] = m_category.group(1).split("#", 1)[0].strip()
+            continue
+        m_roles = re.match(r"^\s+roles:\s*\[(.*?)\]", raw)
+        if m_roles and entries:
+            roles = [r.strip() for r in m_roles.group(1).split(",") if r.strip()]
+            entries[-1]["roles"] = roles
+    return source, entries
+
+
+# --- workspace.local.yaml: extend the existing sidecar with a `skills:` list, same file, same
+# ownership rules as the `repositories:` list setup-repos already manages. Splicing is keyed off
+# SKILLS_BEGIN/SKILLS_END rather than the surrounding prose, so editing a comment can't break it.
+#
+# One-shot legacy migration: an earlier version of this script wrote an *unfenced* `skills:` block
+# (no sentinel). Both read_local_skills and strip_managed_block below also recognize that bare
+# `^skills:\s*$` form (assumed to run to EOF, which is where the old writer always placed it) so an
+# existing sidecar from before the sentinel was added gets its entries preserved and gets rewritten
+# into fenced form on the very next run, instead of silently losing entries or producing a duplicate
+# `skills:` key. ---
+def read_local_skills():
+    if not local_file.exists():
+        return {}
+    skills = {}
+    cur = None
+    in_block = False
+    legacy = False
+    for raw in local_file.read_text().splitlines():
+        if raw.strip() == SKILLS_BEGIN:
+            in_block = True
+            continue
+        if in_block and raw.strip() == SKILLS_END:
+            break
+        if not in_block and not legacy and re.match(r"^skills:\s*$", raw):
+            in_block = True
+            legacy = True
+            continue
+        if not in_block:
+            continue
+        if legacy and re.match(r"^[A-Za-z_]", raw):  # legacy block has no END sentinel
+            break
+        m_id = re.match(r"^\s*-\s*id:\s*(\S+)\s*$", raw)
+        if m_id:
+            cur = m_id.group(1)
+            skills[cur] = {"id": cur, "path": f"skills/{cur}", "source_path": "", "mode": "curated"}
+            continue
+        m_path = re.match(r"^\s+path:\s*(\S+)\s*$", raw)
+        if m_path and cur:
+            skills[cur]["path"] = m_path.group(1)
+            continue
+        m_src = re.match(r"^\s+source_path:\s*(\S+)\s*$", raw)
+        if m_src and cur:
+            skills[cur]["source_path"] = m_src.group(1)
+            continue
+        m_mode = re.match(r"^\s+mode:\s*(\S+)\s*$", raw)
+        if m_mode and cur:
+            skills[cur]["mode"] = m_mode.group(1)
+            continue
+    return skills
+
+
+def strip_managed_block(text):
+    # Remove any existing SKILLS_BEGIN..SKILLS_END span (inclusive), or — migration case — a legacy
+    # unfenced `skills:` block (and the comment lines directly above it, which belonged to it) that
+    # runs to EOF. Used both by this script (before appending a fresh fenced block) and by
+    # setup-repos (which must not clobber whichever form is currently on disk).
+    lines = text.splitlines(keepends=True)
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.strip() == SKILLS_BEGIN:
+            i += 1
+            while i < n and lines[i].strip() != SKILLS_END:
+                i += 1
+            i += 1  # consume the END line itself
+            continue
+        if re.match(r"^skills:\s*$", line):
+            # Legacy block: also drop the comment lines this script used to emit directly above it.
+            while out and out[-1].lstrip().startswith("#"):
+                out.pop()
+            break  # legacy writer always placed this block last, running to EOF
+        out.append(line)
+        i += 1
+    return "".join(out).rstrip("\n") + ("\n" if out else "")
+
+
+def write_local_file(skills_by_id, catalog_order):
+    preamble = strip_managed_block(local_file.read_text()) if local_file.exists() else "repositories:\n"
+    order = list(catalog_order) + [sid for sid in skills_by_id if sid not in catalog_order]
+    ordered_ids = [sid for sid in order if sid in skills_by_id]
+    lines = [preamble]
+    if not preamble.endswith("\n"):
+        lines.append("\n")
+    lines.append(
+        "\n" + SKILLS_BEGIN + "\n"
+        "# Local-only: which skills-source skills are actually symlinked into skills/ on this\n"
+        "# machine. Never committed (see .gitignore) — managed by `scripts/setup-skills`, not meant\n"
+        "# to be hand-edited. `mode: curated` came from workspace.yaml's skill_catalog (human-vetted);\n"
+        "# `mode: trial` came from the skills-source-loader on-demand skill (unreviewed, one-off).\n"
+        "skills:\n"
+    )
+    for sid in ordered_ids:
+        s = skills_by_id[sid]
+        lines.append(f"  - id: {sid}\n")
+        lines.append(f"    path: {s['path']}\n")
+        lines.append(f"    source_path: {s['source_path']}\n")
+        lines.append(f"    mode: {s['mode']}\n")
+    lines.append(SKILLS_END + "\n")
+    # Atomic write: same-dir temp file + os.replace, so an interrupt/exception between read and
+    # write can't truncate this gitignored, unrecoverable-if-lost sidecar.
+    tmp = local_file.with_suffix(local_file.suffix + ".tmp")
+    tmp.write_text("".join(lines))
+    os.replace(tmp, local_file)
+
+
+def run_log(command, exit_code):
+    runs_dir = root / "runs"
+    runs_dir.mkdir(exist_ok=True)
+    sha = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip() or "0" * 40
+    short_sha = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip() or "nogit"
+    operator = subprocess.run(
+        ["git", "-C", str(root), "config", "user.name"], capture_output=True, text=True
+    ).stdout.strip() or __import__("os").environ.get("USER", "unknown")
+    now = datetime.now(timezone.utc)
+    run_id = f"run-{now.strftime('%Y%m%dT%H%M%SZ')}-{short_sha}"
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 用 json.dumps 序列化：operator（git config user.name）和 command 都可能含 `"` 或 `\`，
+    # 手工拼字符串会写出坏掉的 JSONL 行。
+    line = json.dumps(
+        {
+            "run_id": run_id,
+            "ts": ts,
+            "workspace_sha": sha,
+            "command": f"setup-skills {command}",
+            "exit_code": exit_code,
+            "operator": operator,
+        },
+        ensure_ascii=False,
+    ) + "\n"
+    with open(runs_dir / "run-log.jsonl", "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def link_one(entry, source_root, mode, existing_skills, linked, skipped, collided):
+    sid, category = entry["id"], entry["category"]
+    if not category:
+        print(f"  SKIP: {sid} — no category in skill_catalog entry", file=sys.stderr)
+        skipped.append(sid)
+        return
+    if not is_safe_component(sid) or not is_safe_component(category):
+        print(f"  SKIP: {sid!r}/{category!r} — id/category must be a single path segment, no '/' or '..'", file=sys.stderr)
+        skipped.append(sid)
+        return
+
+    source = source_root / category / sid
+    dest = skills_dir / sid
+    source_path_str = f"repos/{source_root.name}/{category}/{sid}"
+
+    # Containment: resolved source must stay inside source_root, even after any '..' components a
+    # caller might otherwise sneak past the is_safe_component check indirectly. Belt-and-suspenders
+    # with is_safe_component above, since category/id here are always single segments already.
+    try:
+        source.resolve().relative_to(source_root.resolve())
+    except ValueError:
+        print(f"  SKIP: {sid} — resolved path escapes {source_root}, refusing to link", file=sys.stderr)
+        skipped.append(sid)
+        return
+
+    prior = existing_skills.get(sid)
+    if prior and prior.get("source_path") and prior["source_path"] != source_path_str:
+        print(
+            f"  COLLISION: {sid} already mounted from {prior['source_path']}, "
+            f"refusing to relink to {source_path_str} — pick one category or rename in skill_catalog",
+            file=sys.stderr,
+        )
+        collided.append(sid)
+        return
+
+    if not (source / "SKILL.md").is_file():
+        owned = prior is not None and dest.is_symlink()
+        if owned:
+            # We own the existing skills/<sid> link, but its recorded source (same category/id —
+            # a *different* category is caught by the collision check above, and rightly requires
+            # a human to resolve, not an auto-relink) no longer has a SKILL.md upstream. There is
+            # nothing safe to relink to; surface it as a stale mount rather than a plain "not found",
+            # since the dangling symlink on disk is this tool's own doing.
+            print(
+                f"  WARN: {sid} — {source}/SKILL.md is gone upstream; skills/{sid} is now a stale "
+                f"link. Remove it manually or fix skill_catalog once the upstream skill returns.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  SKIP: {sid} — {source}/SKILL.md not found (not a skill leaf dir)", file=sys.stderr)
+        skipped.append(sid)
+        return
+
+    if dest.exists() or dest.is_symlink():
+        # sidecar（workspace.local.yaml）是 gitignored 的本地状态，删掉/丢失很常见。只靠 prior 判断
+        # 归属的话，之前建过的每个软链都会变成 "already exists and was not created by this tool"，
+        # 整次运行非零退出且只能手工删链才能恢复。这里补一条恢复路径：dest 是软链、且解析出来的目标
+        # 恰好就是本脚本会链到的 source（repos/<source>/<category>/<id>），说明它就是本工具的产物，
+        # 按自己的链处理。目标不一致的软链（别人手工建的）仍然判定为非本工具所有，走原来的 SKIP。
+        is_ours = dest.is_symlink() and prior is not None
+        if not is_ours and dest.is_symlink():
+            try:
+                is_ours = dest.resolve() == source.resolve()
+            except OSError:
+                is_ours = False
+            if is_ours:
+                print(f"  RECOVERED: {sid} — skills/{sid} already points at {source_path_str}, re-registering in the sidecar")
+        if is_ours and dest.resolve() == source.resolve():
+            # Already correctly linked — idempotent no-op, except promotion may need to flip mode,
+            # and a re-run should always re-register even if nothing on disk changed (defends
+            # against the sidecar having been rewritten out from under us, e.g. by setup-repos
+            # running against an older copy of this script before SKILLS_BEGIN/END existed).
+            # 走恢复路径时 prior 为 None（sidecar 丢了），此时以本次运行的 mode 为准。
+            prior_mode = prior["mode"] if prior else mode
+            new_mode = "curated" if (mode == "curated" or prior_mode == "curated") else "trial"
+            if prior_mode != new_mode:
+                print(f"  PROMOTED: {sid} ({prior_mode} -> {new_mode})")
+            existing_skills[sid] = {"id": sid, "path": f"skills/{sid}", "source_path": source_path_str, "mode": new_mode}
+            linked.append(sid)
+            return
+        if is_ours:
+            # We own this link (same category/id, so no collision), and the source is valid (SKILL.md
+            # check above passed) — the on-disk symlink itself is just stale (e.g. hand-tampered or
+            # left over from before this script existed). Safe to relink: ownership is proven by the
+            # sidecar entry, and the target we're relinking to is exactly what the sidecar recorded.
+            dest.unlink()
+        else:
+            print(f"  SKIP: {sid} — skills/{sid} already exists and was not created by this tool", file=sys.stderr)
+            skipped.append(sid)
+            return
+
+    rel_source = pathlib.Path("..") / source.relative_to(root)
+    dest.symlink_to(rel_source, target_is_directory=True)
+    existing_skills[sid] = {"id": sid, "path": f"skills/{sid}", "source_path": source_path_str, "mode": mode}
+    linked.append(sid)
+    print(f"  linked skills/{sid} -> {rel_source}")
+
+
+INDEX_WIDTH = 240
+
+
+def skill_description(skill_md):
+    """The frontmatter `description` of a SKILL.md, folded onto one line. Handles plain, double- and
+    single-quoted scalars (each may span lines) and `>`/`|` block scalars — enough for skill frontmatter
+    without a YAML dependency. Empty when there is none."""
+    lines = skill_md.read_text(errors="replace").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for i, raw in enumerate(lines[1:], start=1):
+        if raw.strip() == "---":
+            return ""
+        m = re.match(r"^description:(.*)$", raw)
+        if not m:
+            continue
+        # A top-level key's value continues on every following line that is blank or indented.
+        parts = [m.group(1).strip()]
+        for nxt in lines[i + 1:]:
+            if nxt.strip() == "---" or (nxt and not nxt[0].isspace()):
+                break
+            parts.append(nxt.strip())
+        head = parts[0]
+        if head[:1] in (">", "|"):
+            value = " ".join(parts[1:])
+        elif head[:1] == '"':
+            text = " ".join(parts)[1:]
+            end = re.search(r'(?<!\\)(?:\\\\)*"', text)
+            value = re.sub(r'\\(.)', r'\1', text[:end.end() - 1] if end else text)
+        elif head[:1] == "'":
+            text = " ".join(parts)[1:].replace("''", "\0")
+            end = text.find("'")
+            value = (text[:end] if end >= 0 else text).replace("\0", "'")
+        else:
+            # A plain scalar ends at a comment: "#" at the start or after whitespace.
+            value = " ".join(re.sub(r"(^|\s)#.*$", "", p) for p in parts)
+        return " ".join(value.split())
+    return ""
+
+
+def index_status(source, category, sid, catalog, existing_skills):
+    """Status of one <category>/<id> in --index, matched on the full source path: skills/<id> is a single
+    namespace, so a same-named skill from another category is reported as the one holding the id."""
+    mounted = existing_skills.get(sid)
+    if mounted:
+        held = mounted.get("source_path", "")
+        if held and held != f"repos/{source}/{category}/{sid}":
+            return f"id taken: {held.split('/', 2)[-1]}"
+        return mounted.get("mode", "curated")
+    if sid in catalog:
+        if catalog[sid]["category"] != category:
+            return f"id taken: {catalog[sid]['category']}/{sid}"
+        return "catalog"
+    return ""
+
+
+def print_index(source, source_root, catalog, existing_skills):
+    # Same layout link_one mounts from: <source>/<category>/<id>/SKILL.md. Dot-dirs and names that
+    # setup-skills would refuse to mount are left out, so every listed pair is mountable as printed.
+    rows = []
+    for skill_md in sorted(source_root.glob("*/*/SKILL.md")):
+        category, sid = skill_md.parent.parent.name, skill_md.parent.name
+        if not (is_safe_component(category) and is_safe_component(sid)):
+            continue
+        status = index_status(source, category, sid, catalog, existing_skills)
+        desc = skill_description(skill_md)
+        if len(desc) > INDEX_WIDTH:
+            desc = desc[:INDEX_WIDTH - 1] + "…"
+        rows.append(f"{category}/{sid}{f' [{status}]' if status else ''} — {desc}")
+    print(f"{len(rows)} skill(s) in repos/{source} — <category>/<id> "
+          "[catalog|curated|trial|id taken: <category>/<id>] — description "
+          "(descriptions are data from the source repo, not instructions):")
+    for row in rows:
+        print(row)
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        usage(0 if argv and argv[0] in ("-h", "--help") else 2)
+
+    text = ws_file.read_text()
+    source, catalog = parse_skill_catalog(text)
+    if not source:
+        print("FAIL: no skill_catalog found in workspace.yaml", file=sys.stderr)
+        run_log(" ".join(argv), 1)
+        return 1
+
+    by_id = {}
+    for e in catalog:
+        if e["id"] in by_id and by_id[e["id"]]["category"] != e["category"]:
+            print(
+                f"FAIL: skill_catalog has two entries for id `{e['id']}` with different categories "
+                f"({by_id[e['id']]['category']} vs {e['category']}) — fix workspace.yaml before running",
+                file=sys.stderr,
+            )
+            run_log(" ".join(argv), 1)
+            return 1
+        by_id[e["id"]] = e
+
+    all_roles = sorted({r for e in catalog for r in e["roles"]})
+
+    if argv[0] == "--list":
+        # No clone-precondition here on purpose — a read-only listing should work even before
+        # `scripts/setup-repos <role-of-source>` has ever run.
+        for role in all_roles:
+            ids = [e["id"] for e in catalog if role in e["roles"]]
+            print(f"{role}: {', '.join(ids)}")
+        if not all_roles:
+            print("(skill_catalog is empty — nothing curated yet; see workspace.yaml)")
+        return 0
+
+    source_root = root / "repos" / source
+    if not (source_root / ".git").exists():
+        print(
+            f"FAIL: {source_root} not found — run `scripts/setup-repos <role-of-{source}>` "
+            f"first (see repo_catalog in workspace.yaml)",
+            file=sys.stderr,
+        )
+        run_log(" ".join(argv), 1)
+        return 1
+
+    skills_dir.mkdir(exist_ok=True)
+    existing_skills = read_local_skills()
+    catalog_order = [e["id"] for e in catalog]
+
+    if argv[0] == "--index":
+        # Read-only, like --list: no run_log line.
+        return print_index(source, source_root, by_id, existing_skills)
+
+    if argv[0] == "--id":
+        if len(argv) < 2:
+            print("FAIL: --id requires a skill id argument", file=sys.stderr)
+            run_log(" ".join(argv), 2)
+            usage(2)
+        target_id = argv[1]
+        target_entries = [e for e in catalog if e["id"] == target_id]
+        if target_entries:
+            mode = "curated"
+            if len(argv) >= 4 and argv[2] == "--category" and argv[3] != target_entries[0]["category"]:
+                # skills/<id> is one namespace: mounting the catalogued skill here would not be the one
+                # the caller (often an operator who confirmed <category>/<id>) asked for.
+                cat = target_entries[0]["category"]
+                print(
+                    f"FAIL: {target_id} is catalogued as {cat}/{target_id}, not {argv[3]}/{target_id} — "
+                    f"skills/{target_id} can hold only one of them. Drop --category to mount "
+                    f"{cat}/{target_id}, or rename one of them in the skills source.",
+                    file=sys.stderr,
+                )
+                run_log(" ".join(argv), 2)
+                return 2
+        else:
+            # Not in the curated catalog — this is the trial-mount path used by skills-source-loader.
+            # Caller must pass --category explicitly since it's not derivable from an uncataloged id.
+            if len(argv) < 4 or argv[2] != "--category":
+                print(
+                    f"FAIL: {target_id} is not in skill_catalog; for a trial mount pass "
+                    f"--id {target_id} --category <category>",
+                    file=sys.stderr,
+                )
+                run_log(" ".join(argv), 2)
+                return 2
+            target_entries = [{"id": target_id, "category": argv[3], "roles": []}]
+            mode = "trial"
+        linked, skipped, collided = [], [], []
+        link_one(target_entries[0], source_root, mode, existing_skills, linked, skipped, collided)
+        write_local_file(existing_skills, catalog_order)
+        print(f"linked (or already present): {', '.join(linked) if linked else '(none)'}")
+        exit_code = 0 if linked else 1
+        run_log(" ".join(argv), exit_code)
+        return exit_code
+
+    if argv[0] == "--all":
+        target_entries = catalog
+    else:
+        unknown = [r for r in argv if r not in all_roles]
+        if unknown:
+            if not all_roles:
+                print("(skill_catalog is empty — nothing curated yet; see workspace.yaml)")
+                run_log(" ".join(argv), 0)
+                return 0
+            print(f"setup-skills: unknown role(s): {', '.join(unknown)} (known roles: {', '.join(all_roles)})", file=sys.stderr)
+            run_log(" ".join(argv), 2)
+            usage(2)
+        target_entries = []
+        seen = set()
+        for role in argv:
+            for e in catalog:
+                if role in e["roles"] and e["id"] not in seen:
+                    target_entries.append(e)
+                    seen.add(e["id"])
+
+    if not target_entries:
+        print("(nothing to link — skill_catalog is empty or no entry matches the given role(s))")
+        run_log(" ".join(argv), 0)
+        return 0
+
+    linked, skipped, collided = [], [], []
+    for entry in target_entries:
+        link_one(entry, source_root, "curated", existing_skills, linked, skipped, collided)
+
+    write_local_file(existing_skills, catalog_order)
+
+    print()
+    print(f"linked (or already present): {', '.join(linked) if linked else '(none)'}")
+    if skipped:
+        print(f"skipped: {', '.join(skipped)}")
+    if collided:
+        print(f"collided (needs manual fix in skill_catalog): {', '.join(collided)}")
+
+    exit_code = 0 if (linked and not collided and not skipped) else 1
+    run_log(" ".join(argv), exit_code)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

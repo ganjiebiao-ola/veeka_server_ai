@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Compatibility shim: AGENTS.md and CLAUDE.md are generated now — this runs scripts/render-agent-entries --check.
+
+Kept under its old name because docs and the sync skill cite it. The inlined blocks it used to byte-check
+are produced by the renderer from the same sources (agent-instructions/security-defaults.md,
+team-context/security-defaults.team.md, rules/team-rules.md).
+"""
+import os
+import pathlib
+import sys
+
+py = sys.executable or "python3"
+os.execv(py, [py, str(pathlib.Path(__file__).resolve().parent / "render-agent-entries"), "--check", *sys.argv[1:]])

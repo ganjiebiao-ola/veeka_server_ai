@@ -1,0 +1,1029 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ai-usage-submission.schema.json",
+  "title": "Personal weekly AI usage submission v2 (#192, ai-usage-weekly)",
+  "description": "One person's weekly AI usage update as written by scripts/ai-usage-weekly submit into <reports-dir>/reports/<week>/<human_id>.json. Machine part (meta/usage/cost.estimated/git/quality) comes from the local collectors + the price table; cost.actual / cost.allocated come only from a bill or ledger (--cost-file, T2 #196); narrative is what the person confirmed. The three cost blocks are shown side by side and NEVER summed: estimated is local-usage-log tokens x price table (an estimate, not a bill), actual is what the bill says, allocated is the share attributed to this person/period. Never contains prompts, file paths, or session ids. The script enforces the `required` keys and types itself (zero-dependency); this file is the documented contract for other consumers.",
+  "type": "object",
+  "required": [
+    "meta",
+    "usage",
+    "cost",
+    "git",
+    "quality",
+    "narrative"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "week",
+        "since",
+        "until",
+        "human_id",
+        "team",
+        "generated_at",
+        "workspace_sha",
+        "tool",
+        "base_source",
+        "business",
+        "timezone",
+        "submission_version"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 2
+        },
+        "week": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-W[0-9]{2}$"
+        },
+        "since": {
+          "type": "string",
+          "format": "date"
+        },
+        "until": {
+          "type": "string",
+          "format": "date"
+        },
+        "human_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "team": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generated_at": {
+          "type": "string"
+        },
+        "workspace_sha": {
+          "type": "string",
+          "description": "full commit SHA of the workspace that produced the file (rules/review.md artifact provenance); empty when not a git checkout"
+        },
+        "tool": {
+          "const": "ai-usage-weekly"
+        },
+        "base_source": {
+          "type": "string",
+          "description": "as reported by token-usage-report meta.base_source: ccusage | native | native(fallback)"
+        },
+        "business": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "业务/职能 from workspace.yaml `business:`; null until the team fills it"
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "description": "IANA name or fixed offset the week boundaries were computed in (fixed per team; T4 checks all submissions agree)"
+        },
+        "submission_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1 on first write; +1 on every re-submit of the same week (a re-submit replaces the record, never adds to it)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "requests",
+        "input",
+        "output",
+        "cache_read",
+        "cache_creation",
+        "cache_hit_rate",
+        "sessions",
+        "task_instances",
+        "by_day",
+        "by_model",
+        "by_bucket",
+        "by_agent"
+      ],
+      "properties": {
+        "requests": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Claude assistant messages + Codex sessions"
+        },
+        "input": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_read": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_creation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_hit_rate": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "cache_read / (input + cache_read + cache_creation), Claude only; null when no Claude data"
+        },
+        "sessions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_instances": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_day": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "requests",
+              "input",
+              "output",
+              "cost"
+            ],
+            "properties": {
+              "requests": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              },
+              "cache_read": {
+                "type": "integer"
+              },
+              "cache_creation": {
+                "type": "integer"
+              },
+              "cost": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "by_model": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "requests",
+              "input",
+              "output",
+              "cost"
+            ],
+            "properties": {
+              "requests": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              },
+              "cache_read": {
+                "type": "integer"
+              },
+              "cache_creation": {
+                "type": "integer"
+              },
+              "cost": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "by_bucket": {
+          "type": "object",
+          "description": "keyed by mounted-repo id, 'workspace', the anonymous 'other', or 'platform' (rows from a platform export — the platform does not know the repo, so they are never attributed to one)",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "requests",
+              "tokens",
+              "cost"
+            ],
+            "properties": {
+              "requests": {
+                "type": "integer"
+              },
+              "tokens": {
+                "type": "integer"
+              },
+              "cost": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "inferred": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "by_agent": {
+          "type": "object",
+          "properties": {
+            "claude": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "codex": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "qoder": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "Qoder local log: credits only (Qoder logs no tokens). Never converted to tokens, never in requests or cost.estimated; unconfirmed against the bill",
+              "required": [
+                "messages",
+                "credits"
+              ],
+              "properties": {
+                "messages": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "credits": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "sessions": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "by_day": {
+                  "type": "object"
+                },
+                "by_bucket": {
+                  "type": "object"
+                },
+                "confirmed": {
+                  "type": "boolean"
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "sources": {
+          "type": "array",
+          "description": "every usage / bill source this submission drew on, with coverage and bookkeeping (T2 #196); shown on the personal and team pages",
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "name",
+              "since",
+              "until",
+              "records"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "local-usage-log",
+                  "platform-export",
+                  "actual-bill"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "description": "a label or file basename — never a path"
+              },
+              "since": {
+                "type": "string"
+              },
+              "until": {
+                "type": "string"
+              },
+              "records": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "superseded": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "local (day, model) cells replaced by the platform record (择一计入)"
+              },
+              "skipped_other_users": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "out_of_window": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "reported_cost": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "description": "a cost column the platform export carried — kept apart, 性质待核实, never cost.actual",
+                "properties": {
+                  "amount": {
+                    "type": "number"
+                  },
+                  "currency": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cells": {
+          "type": "array",
+          "description": "day × model × bucket cells after 择一 (so the team side can dedup at the same grain); aggregates only — no session ids, no paths",
+          "items": {
+            "type": "object",
+            "required": [
+              "day",
+              "model",
+              "bucket",
+              "requests",
+              "input",
+              "output",
+              "cache_read",
+              "cache_creation",
+              "source"
+            ],
+            "properties": {
+              "day": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "bucket": {
+                "type": "string"
+              },
+              "requests": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              },
+              "cache_read": {
+                "type": "integer"
+              },
+              "cache_creation": {
+                "type": "integer"
+              },
+              "source": {
+                "enum": [
+                  "local-usage-log",
+                  "platform-export"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "description": "三种金额分列展示,不相加。",
+      "required": [
+        "estimated",
+        "actual",
+        "allocated"
+      ],
+      "properties": {
+        "estimated": {
+          "type": "object",
+          "description": "Tokens x assets/pricing.json. ALWAYS an estimate (估算), never a bill: shown with the pricing version, never enters 核算/报销 or budget totals.",
+          "required": [
+            "amount",
+            "currency",
+            "nature",
+            "source",
+            "method",
+            "pricing_version",
+            "unpriced_models",
+            "period",
+            "confirmed",
+            "note"
+          ],
+          "properties": {
+            "amount": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$"
+            },
+            "nature": {
+              "enum": [
+                "api",
+                "seat",
+                "gpu",
+                "shared"
+              ],
+              "description": "费用性质"
+            },
+            "source": {
+              "enum": [
+                "local-usage-log",
+                "platform-export",
+                "local-usage-log+platform-export"
+              ],
+              "description": "which usage cells the estimate was computed from — still an estimate either way"
+            },
+            "period": {
+              "type": "object",
+              "required": [
+                "since",
+                "until"
+              ],
+              "properties": {
+                "since": {
+                  "type": "string",
+                  "format": "date"
+                },
+                "until": {
+                  "type": "string",
+                  "format": "date"
+                }
+              },
+              "additionalProperties": false
+            },
+            "confirmed": {
+              "const": false
+            },
+            "method": {
+              "const": "price-table"
+            },
+            "pricing_version": {
+              "type": "string"
+            },
+            "unpriced_models": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "actual": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "description": "What the bill / ledger says. Enters 核算与报销.",
+              "required": [
+                "amount",
+                "currency",
+                "nature",
+                "source",
+                "period",
+                "confirmed"
+              ],
+              "properties": {
+                "amount": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "currency": {
+                  "type": "string",
+                  "pattern": "^[A-Z]{3}$"
+                },
+                "nature": {
+                  "enum": [
+                    "api",
+                    "seat",
+                    "gpu",
+                    "shared"
+                  ],
+                  "description": "费用性质"
+                },
+                "source": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "where the figure comes from (ledger / bill id / local-usage-log); never a path"
+                },
+                "period": {
+                  "type": "object",
+                  "required": [
+                    "since",
+                    "until"
+                  ],
+                  "properties": {
+                    "since": {
+                      "type": "string",
+                      "format": "date"
+                    },
+                    "until": {
+                      "type": "string",
+                      "format": "date"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "confirmed": {
+                  "type": "boolean",
+                  "description": "true only when the billing owner confirmed it"
+                },
+                "items": {
+                  "type": "array",
+                  "description": "one entry per bill / ledger row behind this block (written by --bill): lets `request review` match a single bill_ref and the budget month intersect each bill's own service period. Amounts add up to `amount`.",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "source",
+                      "amount",
+                      "period"
+                    ],
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "amount": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "nature": {
+                        "enum": [
+                          "api",
+                          "seat",
+                          "gpu",
+                          "shared"
+                        ]
+                      },
+                      "period": {
+                        "type": "object",
+                        "required": [
+                          "since",
+                          "until"
+                        ],
+                        "properties": {
+                          "since": {
+                            "type": "string",
+                            "format": "date"
+                          },
+                          "until": {
+                            "type": "string",
+                            "format": "date"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "allocated": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "description": "Share of an actual cost attributed to this person / report week (by service period, project use, or confirmed ratio).",
+              "required": [
+                "amount",
+                "currency",
+                "nature",
+                "source",
+                "period",
+                "confirmed",
+                "basis"
+              ],
+              "properties": {
+                "amount": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "currency": {
+                  "type": "string",
+                  "pattern": "^[A-Z]{3}$"
+                },
+                "nature": {
+                  "enum": [
+                    "api",
+                    "seat",
+                    "gpu",
+                    "shared"
+                  ],
+                  "description": "费用性质"
+                },
+                "source": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "where the figure comes from (ledger / bill id / local-usage-log); never a path"
+                },
+                "period": {
+                  "type": "object",
+                  "required": [
+                    "since",
+                    "until"
+                  ],
+                  "properties": {
+                    "since": {
+                      "type": "string",
+                      "format": "date"
+                    },
+                    "until": {
+                      "type": "string",
+                      "format": "date"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "confirmed": {
+                  "type": "boolean",
+                  "description": "true only when the billing owner confirmed it"
+                },
+                "basis": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "how the share was computed"
+                },
+                "items": {
+                  "type": "array",
+                  "description": "one entry per bill / ledger row behind this block (written by --bill): lets `request review` match a single bill_ref and the budget month intersect each bill's own service period. Amounts add up to `amount`.",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "source",
+                      "amount",
+                      "period"
+                    ],
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "amount": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "nature": {
+                        "enum": [
+                          "api",
+                          "seat",
+                          "gpu",
+                          "shared"
+                        ]
+                      },
+                      "period": {
+                        "type": "object",
+                        "required": [
+                          "since",
+                          "until"
+                        ],
+                        "properties": {
+                          "since": {
+                            "type": "string",
+                            "format": "date"
+                          },
+                          "until": {
+                            "type": "string",
+                            "format": "date"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "description": "per bucket: commits / insertions / deletions in the window (from token-usage-report)",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "commits": {
+            "type": "integer"
+          },
+          "insertions": {
+            "type": "integer"
+          },
+          "deletions": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "narrative": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "summary",
+            "projects",
+            "reusable_methods",
+            "failed_experiments",
+            "issues",
+            "next_actions"
+          ],
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "projects": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "headline",
+                  "tasks"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "headline": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "value": {
+                    "type": "string"
+                  },
+                  "tasks": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "title"
+                      ],
+                      "properties": {
+                        "title": {
+                          "type": "string"
+                        },
+                        "detail": {
+                          "type": "string"
+                        },
+                        "evidence": {
+                          "type": "string"
+                        },
+                        "ai_role": {
+                          "type": "string",
+                          "description": "AI 参与方式 (起草 / 改写 / 生成测试 / 排查 ...)"
+                        },
+                        "deliverable": {
+                          "type": "string",
+                          "description": "交付物 (PR / 文档 / 配置 ...), no paths"
+                        },
+                        "status": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "risks": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "reusable_methods": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "failed_experiments": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "issues": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "next_actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "priority",
+                  "item"
+                ],
+                "properties": {
+                  "priority": {
+                    "enum": [
+                      "high",
+                      "mid",
+                      "low"
+                    ]
+                  },
+                  "item": {
+                    "type": "string"
+                  },
+                  "acceptance": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "resource_needs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "下一步资源需求 (feeds T6 request)"
+            }
+          }
+        }
+      ]
+    },
+    "quality": {
+      "type": "object",
+      "description": "质量与归属 — program checks + attribution owner confirmations.",
+      "required": [
+        "missing_sources",
+        "unpriced_models",
+        "shared_costs",
+        "allocation",
+        "confirmed_by"
+      ],
+      "properties": {
+        "missing_sources": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "platform-export",
+              "actual-bill",
+              "local-usage-log",
+              "git"
+            ]
+          },
+          "description": "sources that should exist but were not provided; shown as 待接入/待核实, never as 0"
+        },
+        "unpriced_models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shared_costs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "description",
+              "amount",
+              "currency"
+            ],
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "amount": {
+                "type": "number",
+                "minimum": 0
+              },
+              "currency": {
+                "type": "string",
+                "pattern": "^[A-Z]{3}$"
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "shared resources this person used but that must not be attributed to the account holder alone"
+        },
+        "allocation": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "target",
+              "ratio"
+            ],
+            "properties": {
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "ratio": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100
+              }
+            },
+            "additionalProperties": false
+          },
+          "description": "cost split across projects/teams; ratios must sum to 100 when non-empty (归属守恒)"
+        },
+        "confirmed_by": {
+          "type": "object",
+          "required": [
+            "member",
+            "billing",
+            "attribution"
+          ],
+          "properties": {
+            "member": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "human_id once the narrative is confirmed"
+            },
+            "billing": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "账单负责人 who confirmed actual/allocated"
+            },
+            "attribution": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "归属负责人 who confirmed allocation/shared_costs"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

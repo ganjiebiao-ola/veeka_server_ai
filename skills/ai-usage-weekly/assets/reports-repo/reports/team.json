@@ -1,0 +1,15 @@
+{
+  "team": "<team name as in workspace.yaml team>",
+  "members": [
+    "<human_id>",
+    "<human_id>"
+  ],
+  "timezone": "Asia/Singapore",
+  "business": "<业务/职能>",
+  "platform_ids": {
+    "<platform user id>": "<human_id>"
+  },
+  "identities": {
+    "<key email or commit author email or GitHub login>": "<human_id>"
+  }
+}

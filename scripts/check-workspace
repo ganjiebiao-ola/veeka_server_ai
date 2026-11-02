@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Validate structure + manifest for a workspace: the core of `ws validate` (#50).
+
+Zero-dependency (stdlib only), a sibling of check-asset-metadata. Reads platform-internals/schemas/workspace.schema.json
+and checks two things against the workspace at ROOT (default: this repo; override with argv[1]):
+  - structure completeness: every path in the schema's x_required_paths exists;
+  - manifest validity: workspace.yaml declares every top-level key in the schema's `required`.
+
+Manifest parsing is a deliberately tiny hand-walk (top-level `key:` lines only) — no pyyaml. It is
+not a full JSON-Schema validator; deeper value/type checks are out of scope here. agent_suites
+version drift is not yet checked anywhere (a #50 follow-up — do not assume `ws health` covers it).
+"""
+import json
+import re
+import sys
+import pathlib
+
+script_root = pathlib.Path(__file__).resolve().parent.parent
+target = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else script_root
+
+schema_file = script_root / "platform-internals" / "schemas" / "workspace.schema.json"
+if not schema_file.exists():
+    print("FAIL: workspace validate")
+    print("  - missing platform-internals/schemas/workspace.schema.json — the required-paths list lives there,")
+    print("    so without it `ws validate` has no definition of a complete workspace to check against.")
+    print("  - platform-internals/ is the self-proving layer, not optional: restore it from the template.")
+    sys.exit(1)
+
+schema = json.loads(schema_file.read_text())
+
+errors = []
+
+# --- structure completeness ---
+for rel in schema.get("x_required_paths", []):
+    if not (target / rel).exists():
+        errors.append(f"missing required path: {rel}")
+
+# --- manifest validity: top-level required keys present ---
+wsfile = target / "workspace.yaml"
+if not wsfile.exists():
+    errors.append("missing workspace.yaml")
+else:
+    top_keys = set()
+    for line in wsfile.read_text().splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*):", line)   # top-level key = column-0 `key:`
+        if m:
+            top_keys.add(m.group(1))
+    for key in schema.get("required", []):
+        if key not in top_keys:
+            errors.append(f"workspace.yaml missing required key: {key}")
+
+if errors:
+    print("FAIL: workspace validate")
+    for e in errors:
+        print("  -", e)
+    sys.exit(1)
+
+print(f"OK: structure complete and workspace.yaml declares all required keys ({target.name})")

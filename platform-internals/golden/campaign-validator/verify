@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# platform-internals/golden/campaign-validator/verify — static closure check for this pack (#44).
+#
+# Read-only: it never touches repos/ and never runs the toy validator. That is `replay`'s job.
+# This is the half that belongs on the main green line, so `ws test` calls it (via platform-internals/golden/*/verify)
+# while `replay` stays out of it — `ws test` must be safe to run anywhere, including CI.
+#
+# The checks themselves live in scripts/check-golden-pack, alongside the other guards, so they
+# follow the same stdout contract check-health consumes (last line = summary, `-` lines = detail).
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$here/../../.." && pwd)   # pack -> platform-internals/golden -> platform-internals -> workspace root
+exec python3 "$root/scripts/check-golden-pack" "$here"

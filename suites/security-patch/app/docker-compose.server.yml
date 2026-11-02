@@ -1,0 +1,42 @@
+# Linux server override — layer on top of the base compose:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml up -d --build
+#
+# or simply:  ./scripts/dev.sh compose:server:start
+#
+# What it changes vs the base (macOS dev) compose:
+#   1. Ports bind to 127.0.0.1 only. The app has NO authentication layer, so we
+#      never expose it on 0.0.0.0. Reach it via an SSH tunnel:
+#        ssh -L 32088:localhost:32088 you@server   # then open http://localhost:32088
+#      For VPN access instead, replace 127.0.0.1 with the server's VPN-facing
+#      IP below AND firewall the port to the VPN subnet only.
+#   2. OAuth-on-server wiring: mount the host's cron-refreshed credentials file
+#      into the backend container (RO) and point OLA_AGENT_CREDENTIALS_SOURCE at
+#      it. The per-run refresh reads this and writes the slice to
+#      .runtime/.credentials.json (RW, from the base compose) for the scanner.
+#      ${HOME} is expanded by the shell running `docker compose`, i.e. the user
+#      who ran `claude login` + owns the keep-claude-token-fresh cron.
+#
+# If you use ANTHROPIC_API_KEY instead of OAuth, you don't need this file's
+# credentials mount — just set ANTHROPIC_API_KEY in .env and the base compose
+# forwards it. (Then OLA_AGENT_CREDENTIALS_SOURCE stays empty and no OAuth file
+# is read.)
+
+services:
+  backend:
+    # `!override` replaces the base list instead of appending to it. Without
+    # it Compose v2.24+ merges the two files' ports, yielding BOTH
+    # 0.0.0.0:37018 and 127.0.0.1:37018 — the second bind then fails with
+    # "address already in use" and the stack never starts.
+    ports: !override
+      - "127.0.0.1:37018:37018"
+    environment:
+      # Host OAuth credentials, mounted read-only just below. The keep-fresh
+      # cron rewrites the host file every 6h; each scan re-reads it here.
+      OLA_AGENT_CREDENTIALS_SOURCE: /host-claude/.credentials.json
+    volumes:
+      - ${HOME}/.claude/.credentials.json:/host-claude/.credentials.json:ro
+
+  frontend:
+    ports: !override
+      - "127.0.0.1:32088:80"

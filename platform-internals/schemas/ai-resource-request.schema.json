@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ai-resource-request.schema.json",
+  "title": "AI resource request (#192 T6, ai-usage-weekly request)",
+  "description": "One request for an AI tool / model / resource as written by `scripts/ai-usage-weekly request --form` into <reports-dir>/reports/requests/<yyyy-mm>-<human_id>-<slug>.json. It is a DRAFT for the company's existing approval flow — the tool never submits for approval, never buys, never calls the network. Closed loop: status draft → confirmed → purchased → expired; bill_refs link the bought resource to bill records (submit --bill); review_before_renewal holds the pre-renewal verdict.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "created_at",
+    "human_id",
+    "team",
+    "kind",
+    "resource",
+    "business",
+    "project",
+    "purpose",
+    "outcome",
+    "amount",
+    "currency",
+    "start",
+    "end",
+    "renewal",
+    "allocation",
+    "split",
+    "note",
+    "status",
+    "bill_refs",
+    "review_before_renewal",
+    "workspace_sha"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[^/]+$",
+      "description": "<yyyy-mm of start>-<human_id>-<slug>; also the file basename"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "human_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "申请人 = workspace.yaml owner; people are accountable"
+    },
+    "team": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "new",
+        "quota",
+        "renewal"
+      ],
+      "description": "申请类型: 新购资源 / 增加额度 / 续费"
+    },
+    "resource": {
+      "type": "string",
+      "minLength": 1,
+      "description": "工具 / 模型 / 资源"
+    },
+    "business": {
+      "type": "string",
+      "minLength": 1,
+      "description": "业务 / 职能"
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "description": "团队 / 项目"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "工作用途与现有资源不足"
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 1,
+      "description": "预期产出与验证方式"
+    },
+    "amount": {
+      "type": "number",
+      "minimum": 0,
+      "description": "预计完整付款金额"
+    },
+    "currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "start": {
+      "type": "string",
+      "format": "date"
+    },
+    "end": {
+      "type": "string",
+      "format": "date",
+      "description": "must be >= start"
+    },
+    "renewal": {
+      "enum": [
+        "once",
+        "monthly",
+        "yearly",
+        "manual"
+      ],
+      "description": "一次性不自动续费 / 按月自动 / 按年自动 / 到期后人工确认"
+    },
+    "allocation": {
+      "enum": [
+        "single",
+        "split",
+        "shared"
+      ],
+      "description": "费用归属: 归属上述单一项目 / 多个项目分摊 / 团队共享成本"
+    },
+    "split": {
+      "type": "array",
+      "description": "required when allocation = split; ratios sum to 100",
+      "items": {
+        "type": "object",
+        "required": [
+          "target",
+          "ratio"
+        ],
+        "properties": {
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ratio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "note": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "confirmed",
+        "purchased",
+        "expired",
+        "rejected"
+      ]
+    },
+    "bill_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "bill / ledger source strings (as in cost.actual.source) once purchased"
+    },
+    "review_before_renewal": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "verdict",
+            "reason",
+            "reviewed_at",
+            "reviewed_by"
+          ],
+          "properties": {
+            "verdict": {
+              "enum": [
+                "continue",
+                "adjust",
+                "stop"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reviewed_at": {
+              "type": "string"
+            },
+            "reviewed_by": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "workspace_sha": {
+      "type": "string"
+    }
+  }
+}

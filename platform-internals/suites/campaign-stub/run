@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# [stub] campaign-stub run entry — deterministic no-op. Replace with the real pipeline.
+echo "[stub] campaign-stub: run — no-op demo, replace with real pipeline"
+exit 0

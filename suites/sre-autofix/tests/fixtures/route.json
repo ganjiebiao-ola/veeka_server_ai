@@ -1,0 +1,1 @@
+{"action": "triage", "rid": "R-01", "rule_name": "API | 5xx", "layer": "L6", "template": "api-5xx.md"}

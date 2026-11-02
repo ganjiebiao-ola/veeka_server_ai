@@ -1,0 +1,117 @@
+{
+ "meta": {
+  "schema_version": 1,
+  "week": "2026-W33",
+  "since": "2026-08-10",
+  "until": "2026-08-16",
+  "human_id": "bob",
+  "team": "fixture-team",
+  "generated_at": "2026-08-17T10:00:00+08:00",
+  "workspace_sha": "0123456789abcdef",
+  "tool": "ai-usage-weekly",
+  "base_source": "native"
+ },
+ "usage": {
+  "requests": 20,
+  "input": 3000,
+  "output": 900,
+  "cache_read": 1000,
+  "cache_creation": 0,
+  "cache_hit_rate": 0.25,
+  "sessions": 3,
+  "task_instances": 3,
+  "by_day": {
+   "2026-08-10": {
+    "requests": 5,
+    "input": 1000,
+    "output": 300,
+    "cache_read": 0,
+    "cache_creation": 0,
+    "cost": 0.9
+   },
+   "2026-08-11": {
+    "requests": 15,
+    "input": 2000,
+    "output": 600,
+    "cache_read": 0,
+    "cache_creation": 0,
+    "cost": 1.85
+   }
+  },
+  "by_model": {
+   "claude-fable-5": {
+    "requests": 12,
+    "input": 2000,
+    "output": 600,
+    "cache_read": 1000,
+    "cache_creation": 0,
+    "cost": 2.0
+   },
+   "claude-sonnet-5": {
+    "requests": 8,
+    "input": 1000,
+    "output": 300,
+    "cache_read": 0,
+    "cache_creation": 0,
+    "cost": 0.75
+   }
+  },
+  "by_bucket": {
+   "alpha": {
+    "requests": 20,
+    "tokens": 4900,
+    "cost": 2.75
+   }
+  },
+  "by_agent": {
+   "claude": {
+    "messages": 20,
+    "input": 3000,
+    "output": 900,
+    "cache_read": 1000,
+    "cache_creation": 0
+   },
+   "codex": null
+  }
+ },
+ "cost": {
+  "estimated_usd": 2.75,
+  "method": "price-table",
+  "pricing_version": "test-1",
+  "unpriced_models": [],
+  "note": "fixture v1"
+ },
+ "git": {
+  "alpha": {
+   "commits": 2,
+   "insertions": 40,
+   "deletions": 5
+  }
+ },
+ "narrative": {
+  "summary": "BOB-SUMMARY 同一任务的测试。",
+  "projects": [
+   {
+    "name": "alpha",
+    "headline": "探测重构 · 测试",
+    "tasks": [
+     {
+      "title": "探测超时单测",
+      "evidence": "PR alpha#12"
+     }
+    ]
+   }
+  ],
+  "reusable_methods": [],
+  "failed_experiments": [
+   "BOB-FAIL 一次改五个分支"
+  ],
+  "issues": [],
+  "next_actions": [
+   {
+    "priority": "low",
+    "item": "BOB-ACTION 补边界用例"
+   }
+  ]
+ }
+}
